@@ -1,0 +1,15 @@
+# Core fine-tuning stack for the Agent-SWE program-repair model.
+# Install with:  pip install -r requirements.txt
+#
+# Note: torch has no wheels for Python 3.14 yet — use Python 3.10-3.12.
+
+torch>=2.3
+transformers>=4.45
+datasets>=2.20
+peft>=0.12
+trl>=0.9
+accelerate>=0.33
+
+# 4-bit QLoRA. CUDA-only: on macOS/CPU the pipeline automatically falls back to
+# standard LoRA, so this line can be omitted there.
+bitsandbytes>=0.43 ; platform_system == "Linux" or platform_system == "Windows"
