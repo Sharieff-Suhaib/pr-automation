@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ path: "../.env" });
 
 const repoUrl = "https://github.com/Small-Fish-Dev/shrimple_character_controller/issues";
 // https://github.com/public-apis/public-apis
@@ -21,8 +21,13 @@ const response = await fetch(
 const issues = await response.json();
 // console.log(issues);
 
-for (const issue of issues) {
-    console.log(`Issue #${issue.number}: ${issue.title}`);
-    console.log(`Body: ${issue.body}`);
-    console.log(`State: ${issue.state}`);
+if (!response.ok) {
+    console.error(`Failed to fetch issues: ${response.status} ${response.statusText}`);
+    console.error(`Error details: ${issues.message}`);
+} else {
+    for (const issue of issues) {
+        console.log(`Issue #${issue.number}: ${issue.title}`);
+        console.log(`Body: ${issue.body}`);
+        console.log(`State: ${issue.state}\n`);
+    }
 }
