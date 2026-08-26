@@ -18,9 +18,6 @@
     "url": "https://github.com/Sharieff-Suhaib/pr-automation/issues"
   },
   "homepage": "https://github.com/Sharieff-Suhaib/pr-automation#readme",
-  "devDependencies": {
-    "playwright": "^1.62.1"
-  },
   "dependencies": {
     "dotenv": "^17.4.2"
   }
