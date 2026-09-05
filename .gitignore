@@ -8,3 +8,5 @@ node_modules/
 outputs/
 data/processed/*
 !data/processed/humanevalfix_base.json
+
+src/agents/repository-agent/repositories/
