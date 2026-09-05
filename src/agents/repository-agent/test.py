@@ -1,15 +1,39 @@
 from clone_repo import clone_repository
+from code_parser import get_source_files, extract_code_nodes
 
 
-repo1 = "https://github.com/Sharieff-Suhaib/dummy_repo.git"
+repo_url = "https://github.com/Sharieff-Suhaib/dummy_repo.git"
 
-# repo2 = "https://github.com/Sharieff-Suhaib/image-captioning.git"
+repo_path = clone_repository(repo_url)
+
+files = get_source_files(repo_path)
+
+print("\nSOURCE FILES")
+print("=" * 50)
+
+for file in files:
+    print(file)
 
 
-path1 = clone_repository(repo1)
-# path2 = clone_repository(repo2)
+print("\nCODE NODES")
+print("=" * 50)
 
+for file in files:
 
-print("\nRepositories:")
-print("Repo 1:", path1)
-# print("Repo 2:", path2)
+    nodes = extract_code_nodes(file, repo_path)
+
+    for node in nodes:
+
+        print("\nFile:", node["file"])
+        print("Language:", node["language"])
+        print("Type:", node["type"])
+        print("Name:", node["name"])
+        print("Parent:", node["parent"])
+        print(
+            "Lines:",
+            node["start_line"],
+            "-",
+            node["end_line"]
+        )
+        print("Code:")
+        print(node["code"])
