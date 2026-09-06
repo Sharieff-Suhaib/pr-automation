@@ -1,0 +1,122 @@
+[
+  {
+    "issue": "Login fails when username is empty",
+    "fix": "Add validation for empty username",
+    "type": "input_validation"
+  },
+  {
+    "issue": "Application crashes when user is null",
+    "fix": "Add null check before accessing user",
+    "type": "null_reference"
+  },
+  {
+    "issue": "NoneType object has no attribute 'get' when config is missing",
+    "fix": "Add null check before reading config values",
+    "type": "null_reference"
+  },
+  {
+    "issue": "IndexError when accessing the first element of an empty list",
+    "fix": "Check that the list is non-empty before indexing",
+    "type": "boundary_error"
+  },
+  {
+    "issue": "Off-by-one error causes the last item in the list to be skipped",
+    "fix": "Fix the loop bound to include the last index",
+    "type": "boundary_error"
+  },
+  {
+    "issue": "Application crashes when dividing by zero in the discount calculation",
+    "fix": "Add a check for zero before dividing",
+    "type": "boundary_error"
+  },
+  {
+    "issue": "Search endpoint is vulnerable to SQL injection",
+    "fix": "Use parameterized queries instead of string concatenation",
+    "type": "input_validation"
+  },
+  {
+    "issue": "Signup form accepts invalid email addresses",
+    "fix": "Validate email format before creating the account",
+    "type": "input_validation"
+  },
+  {
+    "issue": "API response is slow when the dataset has more than 10000 rows",
+    "fix": "Add pagination and an index on the query column",
+    "type": "performance"
+  },
+  {
+    "issue": "Application uses excessive memory when processing large CSV files",
+    "fix": "Stream the file instead of loading it fully into memory",
+    "type": "performance"
+  },
+  {
+    "issue": "File upload endpoint times out for large files",
+    "fix": "Increase the timeout and stream the upload",
+    "type": "performance"
+  },
+  {
+    "issue": "Application crashes with an unhandled exception when the file does not exist",
+    "fix": "Wrap the file read in a try/except and return a friendly error",
+    "type": "exception_handling"
+  },
+  {
+    "issue": "Unhandled exception when the external API is unreachable",
+    "fix": "Add a try/except around the API call with a retry",
+    "type": "exception_handling"
+  },
+  {
+    "issue": "Payment fails silently when the gateway times out",
+    "fix": "Catch the timeout exception and surface an error to the user",
+    "type": "exception_handling"
+  },
+  {
+    "issue": "Discount calculation returns the wrong value for orders exactly at the threshold",
+    "fix": "Fix the comparison operator from < to <= at the threshold",
+    "type": "logic_error"
+  },
+  {
+    "issue": "Sorting function returns items in the wrong order for equal values",
+    "fix": "Use a stable sort with a correct comparator",
+    "type": "logic_error"
+  },
+  {
+    "issue": "Date parser returns the wrong month for dates in December",
+    "fix": "Fix the off-by-one month index in the date parser",
+    "type": "logic_error"
+  },
+  {
+    "issue": "Password reset link never expires",
+    "fix": "Add an expiry timestamp and check it before allowing reset",
+    "type": "input_validation"
+  },
+  {
+    "issue": "Application crashes when the config file is empty",
+    "fix": "Add a default configuration and validate the loaded file",
+    "type": "null_reference"
+  },
+  {
+    "issue": "Duplicate orders are created when the submit button is clicked twice",
+    "fix": "Disable the submit button after the first click and debounce the request",
+    "type": "logic_error"
+  },
+  {
+    "issue": "Cache is never invalidated after an update, returning stale data",
+    "fix": "Invalidate the cache entry whenever the underlying data changes",
+    "type": "logic_error"
+  },
+  {
+    "issue": "Application crashes on startup when a required environment variable is missing",
+    "fix": "Validate required environment variables at startup and fail with a clear message",
+    "type": "input_validation"
+  },
+  {
+    "issue": "Negative numbers are accepted in the quantity field",
+    "fix": "Add a validation rule rejecting quantities less than one",
+    "type": "input_validation"
+  },
+  {
+    "issue": "Application crashes when the API returns an empty response body",
+    "fix": "Add a null/empty check before parsing the response JSON",
+    "type": "null_reference"
+  }
+]
