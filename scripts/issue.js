@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config({ path: "../.env" });
+const repoUrl = "https://github.com/Sharieff-Suhaib/dummy_repo/issues";
 
-const repoUrl = "https://github.com/Small-Fish-Dev/shrimple_character_controller/issues";
 // https://github.com/public-apis/public-apis
 const url = new URL(repoUrl);
 

@@ -65,6 +65,31 @@
   .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   .check input { width: 15px; height: 15px; }
 
+  .inline { display: flex; gap: 8px; }
+  .inline input { flex: 1; }
+  button.ghost {
+    background: #fff;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  button.ghost:hover { background: #f2f4f7; border-color: #c9cfd7; }
+  button.ghost:disabled { background: #f2f4f7; color: var(--muted); }
+  select {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    font: inherit;
+    background: #fff;
+    color: inherit;
+  }
+  select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .meta { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  .warn { color: var(--fail); }
+
   .actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; }
   button {
     padding: 9px 20px;
@@ -158,12 +183,22 @@
 
     <div class="field">
       <label for="repo_url">Repository URL or local path</label>
-      <input type="text" id="repo_url" placeholder="https://github.com/owner/repo.git" required>
+      <div class="inline">
+        <input type="text" id="repo_url" placeholder="https://github.com/owner/repo.git" required>
+        <button type="button" class="ghost" id="load_issues">Load issues</button>
+      </div>
+      <div class="meta" id="issues_note"></div>
+    </div>
+
+    <div class="field" id="picker" hidden>
+      <label for="issue_select">Repository issues</label>
+      <select id="issue_select"></select>
+      <div class="meta" id="issue_link"></div>
     </div>
 
     <div class="field">
       <label for="issue">Issue</label>
-      <textarea id="issue" placeholder="Describe what is broken..." required></textarea>
+      <textarea id="issue" placeholder="Describe what is broken, or pick an issue above..." required></textarea>
     </div>
 
     <div class="row">
@@ -202,6 +237,7 @@ const bullets = (items, cls) =>
     : '<p class="empty">none</p>';
 
 let sample = null;
+let issues = [];
 
 async function loadSample() {
   if (!sample) sample = await (await fetch("/sample")).json();
@@ -209,13 +245,78 @@ async function loadSample() {
 }
 
 // Ticking the offline box fills the form with the bundled demo, so the whole
-// pipeline can be run without a network and without a model.
+// pipeline can be run without a network and without a model. The issue picker
+// is hidden because the bundled repository has no GitHub issues to list.
 $("offline").addEventListener("change", async (event) => {
-  if (!event.target.checked) return;
+  const offline = event.target.checked;
+  $("load_issues").disabled = offline;
+  if (!offline) return;
+
+  hidePicker();
+  $("issues_note").textContent = "";
   const demo = await loadSample();
   $("repo_url").value = demo.repo_url;
   $("issue").value = demo.issue;
 });
+
+// Online mode: list the repository's real issues and let one be picked, rather
+// than making the user paste the text by hand.
+$("load_issues").addEventListener("click", async () => {
+  const repoUrl = $("repo_url").value.trim();
+
+  $("load_issues").disabled = true;
+  $("issues_note").className = "meta";
+  $("issues_note").textContent = "Loading issues from GitHub...";
+  hidePicker();
+
+  try {
+    const response = await fetch("/issues?repo_url=" + encodeURIComponent(repoUrl));
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Could not load issues.");
+
+    issues = data.issues || [];
+    if (!issues.length) {
+      $("issues_note").textContent = "No open issues in " + data.owner + "/" + data.repo + ".";
+      return;
+    }
+
+    const select = $("issue_select");
+    select.innerHTML = issues
+      .map((issue, index) =>
+        '<option value="' + index + '">#' + issue.number + " - " + esc(issue.title) + "</option>")
+      .join("");
+    $("picker").hidden = false;
+    chooseIssue(0);
+    $("issues_note").textContent =
+      issues.length + " open issue" + (issues.length === 1 ? "" : "s") +
+      " in " + data.owner + "/" + data.repo + ".";
+  } catch (error) {
+    $("issues_note").className = "meta warn";
+    $("issues_note").textContent = error.message;
+  } finally {
+    $("load_issues").disabled = $("offline").checked;
+  }
+});
+
+$("issue_select").addEventListener("change", (event) => chooseIssue(Number(event.target.value)));
+
+// Copy the chosen issue into the textarea, which stays editable so the text can
+// be trimmed before the run.
+function chooseIssue(index) {
+  const issue = issues[index];
+  if (!issue) return;
+  $("issue").value = (issue.title + "\n\n" + issue.body).trim();
+  $("issue_link").innerHTML = issue.url
+    ? '<a href="' + esc(issue.url) + '" target="_blank" rel="noopener">View #' + issue.number +
+      " on GitHub</a>" + (issue.labels.length ? " &middot; " + esc(issue.labels.join(", ")) : "")
+    : "";
+}
+
+function hidePicker() {
+  $("picker").hidden = true;
+  $("issue_link").innerHTML = "";
+  issues = [];
+}
 
 $("form").addEventListener("submit", async (event) => {
   event.preventDefault();

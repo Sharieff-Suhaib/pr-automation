@@ -2,6 +2,7 @@
 
     GET  /         the single-page UI in static/index.html
     POST /solve    run the full pipeline on one issue
+    GET  /issues   list a GitHub repository's open issues, for the UI's picker
     GET  /health   liveness plus whether Ollama is reachable
     GET  /sample   the bundled offline demo request, used by the UI
 
@@ -21,11 +22,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from orchestrator import adapters
+from orchestrator.github_issues import DEFAULT_LIMIT, GitHubError, fetch_issues
 from orchestrator.manager_agent import solve_issue
 from orchestrator.run_demo import SAMPLE_ISSUE, SAMPLE_PATCH, SAMPLE_REPO
 
@@ -112,6 +114,23 @@ def solve(request: SolveRequest) -> dict[str, Any]:
         codegen_backend=request.codegen_backend,
         stub_patch_path=request.stub_patch_path,
     )
+
+
+@app.get("/issues", summary="List a GitHub repository's issues")
+def issues(
+    repo_url: str = Query(..., description="GitHub repository URL, or an owner/repo shorthand"),
+    state: str = Query("open", pattern="^(open|closed|all)$"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=100),
+) -> dict[str, Any]:
+    """Return the repository's issues so the UI can offer them in a picker.
+
+    Pull requests are filtered out. The GITHUB_TOKEN stays on the server; only
+    the issue summaries reach the browser.
+    """
+    try:
+        return fetch_issues(repo_url, state=state, limit=limit)
+    except GitHubError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.get("/", include_in_schema=False)

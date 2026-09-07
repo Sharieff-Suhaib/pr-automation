@@ -33,7 +33,8 @@ POST /solve
 | `graph.py` | The four nodes and the `StateGraph` wiring them START -> END |
 | `adapters.py` | All integration with Members 1-3 (import plumbing, dataclass -> dict) |
 | `manager_agent.py` | Entry point: takes issue + repo URL, runs the graph, shapes the report |
-| `api.py` | FastAPI app — serves the UI plus `POST /solve`, `GET /sample`, `GET /health` |
+| `api.py` | FastAPI app — serves the UI plus `POST /solve`, `GET /issues`, `GET /sample`, `GET /health` |
+| `github_issues.py` | Lists a repository's issues from the GitHub API (port of `scripts/issue.js`) |
 | `run_demo.py` | CLI runner; prints a summary and saves JSON to `outputs/` |
 | `static/index.html` | The web UI — one page, plain HTML/CSS/JS, no build step |
 | `sample_repo/` | A tiny buggy repository (2 of its 4 tests fail) for offline demos |
@@ -41,11 +42,68 @@ POST /solve
 
 ## Running it
 
-Install once (Python 3.10-3.12):
+Every command below is run from the `pr-automation/` directory, with Python
+3.10-3.12. Install the dependencies once:
 
 ```bash
+cd pr-automation
 pip install -r requirements.txt
 ```
+
+### Start the website
+
+```bash
+python -m uvicorn orchestrator.api:app --host 127.0.0.1 --port 8000
+```
+
+Then open <http://127.0.0.1:8000/> in a browser. Stop the server with `Ctrl+C`.
+
+| URL | What it is |
+| --- | --- |
+| <http://127.0.0.1:8000/> | The web UI |
+| <http://127.0.0.1:8000/docs> | Swagger / OpenAPI docs |
+| <http://127.0.0.1:8000/health> | Whether Ollama is reachable and which models are pulled |
+| <http://127.0.0.1:8000/issues?repo_url=...> | The repository's open issues, as JSON |
+
+During development, add `--reload` to restart the server whenever a Python file
+changes. `static/index.html` is read from disk on every request, so UI edits
+only need a browser refresh either way:
+
+```bash
+python -m uvicorn orchestrator.api:app --reload
+```
+
+If port 8000 is already in use, pick another one with `--port 8010`. On Windows,
+if `python` is not on your PATH, use `py -3` in place of `python`.
+
+### Use the website
+
+**Against a real GitHub repository:**
+
+1. Paste the repository URL and click **Load issues**. The server calls the
+   GitHub API and fills a dropdown with the repository's open issues; pull
+   requests are filtered out.
+2. Pick an issue. Its title and body are copied into the issue box, which stays
+   editable so the text can be trimmed before the run.
+3. Click **Run workflow**.
+
+This path needs Ollama running with a model pulled (see below), otherwise the
+run completes without a patch.
+
+**Offline, with no network and no model:**
+
+1. Tick **Offline demo** — it fills the form from `/sample` with the bundled
+   sample repository and the fixture patch.
+2. Click **Run workflow**.
+
+Either way the report renders below: relevant files, similar bugs, strategy,
+tools, tests, the colourised diff, the test run, and the per-agent trace.
+
+The first run takes around 35 seconds while the embedding model loads; later
+runs reuse it and are quicker. The page shows *Running...* until the whole
+workflow finishes, because `/solve` returns only once the graph is done.
+
+### Command line
 
 **Offline demo** — no network, no model, proves the whole graph works:
 
@@ -59,31 +117,20 @@ goes from 2 failing tests to 4 passing ones.
 **Real run** — clones the repository and generates the patch with the model:
 
 ```bash
-python -m orchestrator.run_demo \
-    --repo-url https://github.com/Sharieff-Suhaib/dummy_repo.git \
-    --issue "Login fails when the username is empty"
+python -m orchestrator.run_demo --repo-url https://github.com/Sharieff-Suhaib/dummy_repo.git --issue "Login fails when the username is empty"
 ```
 
-**Web UI / API** — start the server once and both are available:
+**Call the API directly** — with the server running:
 
 ```bash
-python -m uvicorn orchestrator.api:app --reload
+curl -X POST http://127.0.0.1:8000/solve -H "Content-Type: application/json" -d "{\"repo_url\": \"https://github.com/Sharieff-Suhaib/dummy_repo.git\", \"issue\": \"Login fails when the username is empty\"}"
 ```
 
-* UI: <http://127.0.0.1:8000/>
-* Swagger: <http://127.0.0.1:8000/docs>
+In PowerShell, `curl` is an alias for `Invoke-WebRequest` and takes different
+arguments, so call `curl.exe` explicitly or use:
 
-The UI is one static page that posts to `/solve` and renders the report:
-relevant files, similar bugs, strategy, tools, tests, the colourised diff, the
-test run and the trace. Tick **Offline demo** to fill the form from `/sample`
-and run the bundled repository with the fixture patch — useful for a live
-walkthrough when Ollama is not running.
-
-```bash
-curl -X POST http://127.0.0.1:8000/solve \
-  -H "Content-Type: application/json" \
-  -d '{"repo_url": "https://github.com/Sharieff-Suhaib/dummy_repo.git",
-       "issue": "Login fails when the username is empty"}'
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8000/solve -Method Post -ContentType "application/json" -Body '{"repo_url": "orchestrator/sample_repo", "issue": "get_user crashes on a missing username"}'
 ```
 
 ## The `/solve` contract
@@ -129,6 +176,25 @@ Response (abbreviated):
 `test_status` is the plain `PASS` / `FAIL` / `SKIPPED` string; `test_result`
 keeps the counts and the runner output behind it. `trace` is the audit trail —
 one entry per node, in execution order.
+
+## Listing GitHub issues
+
+`GET /issues?repo_url=<url>&state=open&limit=30` returns the repository's
+issues, and the **Load issues** button in the UI calls it. `repo_url` accepts a
+plain repository URL, a `.git` clone URL, a deep link such as `.../issues`, or
+an `owner/repo` shorthand.
+
+Reads are unauthenticated by default, which GitHub rate-limits to 60 requests
+an hour and which cannot see private repositories. Put a token in
+`pr-automation/.env` to lift both limits:
+
+```
+GITHUB_TOKEN=ghp_your_token_here
+```
+
+The token is read on the server by `github_issues.load_token()` and is never
+sent to the browser — only the issue summaries are. `GITHUB_TOKEN` in the
+environment takes precedence over the `.env` file.
 
 ## Requires Ollama for real patches
 
