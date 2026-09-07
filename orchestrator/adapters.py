@@ -223,8 +223,15 @@ def generate_patch(
     backend: str = "ollama",
     stub_patch_path: str = "",
     repo_path: str = "",
+    chunks: list[dict[str, Any]] | None = None,
+    language: str = "",
 ) -> tuple[str, str]:
     """Return `(unified_diff, source)` for the repair.
+
+    When `chunks` and `repo_path` are given the coding agent rewrites one
+    retrieved function and computes the diff from the file on disk, which is
+    far more reliable with a small model than asking it to write diff syntax.
+    Without them it falls back to asking the model for the diff itself.
 
     `backend="stub"` reads a fixture diff from `stub_patch_path` instead of
     calling the model. It exists so the whole graph can be exercised on a
@@ -250,6 +257,8 @@ def generate_patch(
             tools=tools,
             tests=tests,
             repo_path=repo_path or None,
+            chunks=filter_by_language(chunks or [], language),
+            language=language,
         )
     except PatchGenerationError as error:
         raise AdapterError(str(error)) from error

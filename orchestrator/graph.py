@@ -124,6 +124,8 @@ def coding_agent(state: AgentState) -> AgentState:
             backend=state.get("codegen_backend", "ollama"),
             stub_patch_path=state.get("stub_patch_path", ""),
             repo_path=state.get("repo_path", ""),
+            chunks=relevant_code,
+            language=state.get("language", ""),
         )
     except AdapterError as error:
         return AgentState(

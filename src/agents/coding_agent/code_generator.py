@@ -15,6 +15,14 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from src.agents.coding_agent.code_rewriter import (
+    RewriteError,
+    TargetChunk,
+    build_rewrite_prompt,
+    clean_code_block,
+    diff_from_replacement,
+    select_target,
+)
 from src.agents.coding_agent.diff_validator import (
     DiffError,
     describe_diff_error,
@@ -36,6 +44,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 SYSTEM_PROMPT = """You are a software repair agent.
 Return only a standard unified diff patch. Do not include explanations or Markdown."""
+
+REWRITE_SYSTEM_PROMPT = """You are a software repair agent.
+You are given one function. You reply with the corrected version of that
+function and nothing else: no explanation, no diff, no markdown fence."""
 
 _FENCE_RE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -93,16 +105,43 @@ def generate_patch(
     tests: Any,
     repo_path: str | Path | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    chunks: Any = None,
+    language: str = "",
 ) -> str:
     """Ask the configured LLM for a minimal unified-diff repair patch.
 
-    Each attempt is checked twice: the text must parse as a unified diff, and
-    -- when ``repo_path`` is given -- ``git apply --check`` must accept it
-    against the real repository.  A failure is quoted back to the model with
-    the offending line, which is a far stronger correction than repeating the
-    original instruction, and it means a malformed patch costs one more
-    request instead of the whole run.
+    Two strategies, chosen by what the caller can supply:
+
+    * **Rewrite** (preferred, used when ``chunks`` and ``repo_path`` are
+      given): the model rewrites one function and the diff is computed from
+      the file on disk.  The model never writes diff syntax, so it cannot get
+      it wrong -- see :mod:`code_rewriter` for why that matters.
+    * **Diff** (the fallback): the model writes the unified diff itself.  Each
+      attempt is checked against the diff parser and, when ``repo_path`` is
+      known, ``git apply --check``; a failure is quoted back to the model,
+      which corrects a specific complaint far more reliably than it responds
+      to the original instruction repeated.
     """
+    if chunks and repo_path is not None:
+        try:
+            return generate_patch_by_rewrite(
+                issue,
+                chunks,
+                similar_bugs=similar_bugs,
+                strategy=strategy,
+                tools=tools,
+                tests=tests,
+                repo_path=repo_path,
+                language=language,
+                max_attempts=max_attempts,
+            )
+        except (RewriteError, PatchGenerationError) as error:
+            # Fall through to asking for a diff: a repository layout this
+            # cannot handle is better served by the model's own diff than by
+            # no patch at all.
+            log_note = f"rewrite strategy failed ({error}); asking for a diff instead"
+            print(f"[coding_agent] {log_note}")
+
     prompt = build_repair_prompt(issue, relevant_code, similar_bugs, strategy, tools, tests)
     attempts = max(1, max_attempts)
     complaint = ""
@@ -128,6 +167,59 @@ def generate_patch(
         f"The LLM did not return an applicable unified diff after "
         f"{attempts} attempt(s). Last problem: {complaint}"
     )
+
+
+def generate_patch_by_rewrite(
+    issue: Any,
+    chunks: Any,
+    *,
+    similar_bugs: Any = None,
+    strategy: Any = None,
+    tools: Any = None,
+    tests: Any = None,
+    repo_path: str | Path,
+    language: str = "",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> str:
+    """Rewrite one retrieved function and diff it against the file on disk."""
+    target = select_target(chunks, language)
+    prompt = build_rewrite_prompt(issue, target, similar_bugs, strategy, tools, tests)
+    attempts = max(1, max_attempts)
+    complaint = ""
+
+    for attempt in range(1, attempts + 1):
+        request = prompt if attempt == 1 else _rewrite_correction_prompt(prompt, complaint)
+        response = _call_ollama(request, system=REWRITE_SYSTEM_PROMPT)
+
+        try:
+            # Indentation is aligned inside diff_from_replacement, which has
+            # the file and therefore knows how deeply the code is nested.
+            replacement = clean_code_block(response, target.language)
+            patch = diff_from_replacement(repo_path, target, replacement)
+        except RewriteError as error:
+            complaint = str(error)
+            continue
+
+        complaint = _reject_reason(patch, repo_path)
+        if not complaint:
+            return patch
+
+    raise PatchGenerationError(
+        f"The rewrite of {target.describe()} could not be turned into an "
+        f"applicable patch after {attempts} attempt(s). Last problem: {complaint}"
+    )
+
+
+def _rewrite_correction_prompt(original_prompt: str, complaint: str) -> str:
+    """Repeat the rewrite request, saying what was wrong with the last answer."""
+    return f"""{original_prompt}
+
+Your previous answer was rejected:
+
+{complaint}
+
+Reply with only the corrected code, complete and correctly indented.
+"""
 
 
 def _reject_reason(patch: str, repo_path: str | Path | None) -> str:
@@ -163,13 +255,15 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _call_ollama(prompt: str, model: str = DEFAULT_MODEL) -> str:
+def _call_ollama(
+    prompt: str, model: str = DEFAULT_MODEL, system: str = SYSTEM_PROMPT
+) -> str:
     """Send one non-streaming request to the local Ollama server."""
     payload = json.dumps(
         {
             "model": model,
             "prompt": prompt,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "stream": False,
             "options": {"temperature": 0},
         }
@@ -190,10 +284,10 @@ def _call_ollama(prompt: str, model: str = DEFAULT_MODEL) -> str:
             f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and pull {model}."
         ) from exc
 
-    patch = body.get("response", "")
-    if not patch.strip():
-        raise PatchGenerationError("The LLM returned an empty patch.")
-    return patch
+    answer = body.get("response", "")
+    if not answer.strip():
+        raise PatchGenerationError("The LLM returned an empty response.")
+    return answer
 
 
 def _clean_patch(response: str, repo_path: str | Path | None = None) -> str:
