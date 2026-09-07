@@ -20,6 +20,7 @@ from src.agents.coding_agent.code_rewriter import (
     clean_code_block,
     diff_from_replacement,
     select_target,
+    select_targets,
 )
 from src.agents.coding_agent.diff_validator import validate_unified_diff
 
@@ -251,6 +252,66 @@ def check_target_selection() -> None:
     print("  selected the target in the requested language")
 
 
+def check_multi_file_patch_applies() -> None:
+    """A polyglot repo gets one diff per implementation, in one patch."""
+    auth_py = 'def login(username, password):\n    return username == "admin"\n'
+    repo = _repo({"Auth.java": AUTH_JAVA, "auth.py": auth_py})
+
+    java = diff_from_replacement(repo, LOGIN_CHUNK, FIXED_LOGIN)
+    python_chunk = TargetChunk(
+        file="auth.py", start_line=1, end_line=2, code=auth_py.rstrip(), language="python"
+    )
+    python = diff_from_replacement(
+        repo,
+        python_chunk,
+        'def login(username, password):\n    if not username:\n        return False\n'
+        '    return username == "admin"',
+    )
+
+    combined = java + python
+    files = validate_unified_diff(combined)
+    assert [f.path for f in files] == ["b/Auth.java", "b/auth.py"], [f.path for f in files]
+
+    accepted, error = _git_accepts(repo, combined)
+    assert accepted, f"git rejected the combined patch:\n{error}\n{combined}"
+
+    result = subprocess.run(
+        ["git", "apply", "-"], cwd=repo, input=combined.encode("utf-8"), capture_output=True
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert "isEmpty()" in (repo / "Auth.java").read_text(encoding="utf-8")
+    assert "if not username" in (repo / "auth.py").read_text(encoding="utf-8")
+    print("  a combined multi-file patch applies to every file")
+
+
+def check_one_target_per_file() -> None:
+    """Two hunks in one file would be computed against stale line numbers."""
+    chunks = [
+        {"file": "Auth.java", "language": "java", "start_line": 3, "end_line": 6, "code": "a"},
+        {"file": "Auth.java", "language": "java", "start_line": 8, "end_line": 10, "code": "b"},
+        {"file": "auth.py", "language": "python", "start_line": 1, "end_line": 2, "code": "c"},
+    ]
+    targets = select_targets(chunks, "java", max_targets=9)
+    assert [t.file for t in targets] == ["Auth.java", "auth.py"]
+    assert targets[0].start_line == 3  # the better-ranked hunk wins
+    print("  selected at most one region per file")
+
+
+def check_target_ordering_and_cap() -> None:
+    chunks = [
+        {"file": "auth.py", "language": "python", "start_line": 1, "end_line": 2, "code": "a"},
+        {"file": "auth.cpp", "language": "cpp", "start_line": 1, "end_line": 4, "code": "b"},
+        {"file": "Auth.java", "language": "java", "start_line": 3, "end_line": 6, "code": "c"},
+    ]
+    # The chosen language goes first, but the others are still repaired.
+    assert [t.file for t in select_targets(chunks, "java", max_targets=9)] == [
+        "Auth.java", "auth.py", "auth.cpp",
+    ]
+    assert len(select_targets(chunks, "java", max_targets=2)) == 2
+    assert [t.file for t in select_targets(chunks, "", max_targets=1)] == ["auth.py"]
+    print("  ordered by language and capped by max_targets")
+
+
 def check_prompt_shape() -> None:
     prompt = build_rewrite_prompt(
         "login accepts an empty username", LOGIN_CHUNK, strategy="Validate the input"
@@ -287,6 +348,9 @@ def main() -> int:
         check_missing_file_is_rejected,
         check_answer_cleaning,
         check_target_selection,
+        check_multi_file_patch_applies,
+        check_one_target_per_file,
+        check_target_ordering_and_cap,
         check_prompt_shape,
         check_multiline_and_trailing_newline,
     ):

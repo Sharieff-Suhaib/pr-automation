@@ -21,7 +21,7 @@ from src.agents.coding_agent.code_rewriter import (
     build_rewrite_prompt,
     clean_code_block,
     diff_from_replacement,
-    select_target,
+    select_targets,
 )
 from src.agents.coding_agent.diff_validator import (
     DiffError,
@@ -41,6 +41,11 @@ REQUEST_TIMEOUT_SECONDS = 300
 # three attempts they tend to repeat themselves, so the extra minutes buy
 # nothing.
 DEFAULT_MAX_ATTEMPTS = 3
+
+# How many files one issue may repair. A repository that implements the same
+# function in several languages needs one patch per implementation; a normal
+# repository retrieves one relevant file and this cap never binds.
+DEFAULT_MAX_TARGETS = 4
 
 SYSTEM_PROMPT = """You are a software repair agent.
 Return only a standard unified diff patch. Do not include explanations or Markdown."""
@@ -107,6 +112,7 @@ def generate_patch(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     chunks: Any = None,
     language: str = "",
+    max_targets: int = DEFAULT_MAX_TARGETS,
 ) -> str:
     """Ask the configured LLM for a minimal unified-diff repair patch.
 
@@ -134,6 +140,7 @@ def generate_patch(
                 repo_path=repo_path,
                 language=language,
                 max_attempts=max_attempts,
+                max_targets=max_targets,
             )
         except (RewriteError, PatchGenerationError) as error:
             # Fall through to asking for a diff: a repository layout this
@@ -180,9 +187,66 @@ def generate_patch_by_rewrite(
     repo_path: str | Path,
     language: str = "",
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_targets: int = DEFAULT_MAX_TARGETS,
 ) -> str:
-    """Rewrite one retrieved function and diff it against the file on disk."""
-    target = select_target(chunks, language)
+    """Rewrite the retrieved functions and diff them against the files on disk.
+
+    One region per file, up to ``max_targets`` files, concatenated into a
+    single multi-file patch.  Each file's diff is computed and verified on its
+    own, so one file the model cannot repair does not cost the others: the
+    failures are logged and the successful diffs are still returned.
+    """
+    targets = select_targets(chunks, language, max_targets=max_targets)
+    patches: list[str] = []
+    failures: list[str] = []
+
+    for target in targets:
+        try:
+            patches.append(
+                _rewrite_one(
+                    issue,
+                    target,
+                    similar_bugs=similar_bugs,
+                    strategy=strategy,
+                    tools=tools,
+                    tests=tests,
+                    repo_path=repo_path,
+                    max_attempts=max_attempts,
+                )
+            )
+        except PatchGenerationError as error:
+            failures.append(f"{target.file}: {error}")
+            print(f"[coding_agent] could not repair {target.describe()} -- {error}")
+
+    if not patches:
+        raise PatchGenerationError(
+            "No file could be repaired. " + " | ".join(failures)
+        )
+
+    combined = "".join(patches)
+    complaint = _reject_reason(combined, repo_path)
+    if complaint:
+        # Each part applied on its own, so a combined failure means two of them
+        # touch the same file. Fall back to the best single patch.
+        print(f"[coding_agent] combined patch rejected ({complaint}); using the first file only")
+        return patches[0]
+    if failures:
+        print(f"[coding_agent] repaired {len(patches)} file(s); {len(failures)} could not be repaired")
+    return combined
+
+
+def _rewrite_one(
+    issue: Any,
+    target: TargetChunk,
+    *,
+    similar_bugs: Any,
+    strategy: Any,
+    tools: Any,
+    tests: Any,
+    repo_path: str | Path,
+    max_attempts: int,
+) -> str:
+    """Rewrite one function, retrying with the reason the last answer failed."""
     prompt = build_rewrite_prompt(issue, target, similar_bugs, strategy, tools, tests)
     attempts = max(1, max_attempts)
     complaint = ""
@@ -205,8 +269,8 @@ def generate_patch_by_rewrite(
             return patch
 
     raise PatchGenerationError(
-        f"The rewrite of {target.describe()} could not be turned into an "
-        f"applicable patch after {attempts} attempt(s). Last problem: {complaint}"
+        f"could not turn the rewrite of {target.describe()} into an applicable "
+        f"patch after {attempts} attempt(s). Last problem: {complaint}"
     )
 
 

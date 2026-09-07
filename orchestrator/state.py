@@ -50,6 +50,7 @@ class AgentState(TypedDict, total=False):
 
     # --- Control / configuration ---
     top_k: int
+    max_repair_files: int  # 0 = the coding agent's default
     codegen_backend: str  # "ollama" (default) | "stub"
     stub_patch_path: str  # fixture diff, only read when codegen_backend == "stub"
     status: str  # "running" | "solved" | "failed"
@@ -63,6 +64,7 @@ def new_state(
     issue: str,
     repo_url: str,
     top_k: int = 5,
+    max_repair_files: int = 0,
     codegen_backend: str = "ollama",
     stub_patch_path: str = "",
 ) -> AgentState:
@@ -71,6 +73,7 @@ def new_state(
         issue=issue,
         repo_url=repo_url,
         top_k=top_k,
+        max_repair_files=max_repair_files,
         codegen_backend=codegen_backend,
         stub_patch_path=stub_patch_path,
         status="running",

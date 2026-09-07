@@ -126,6 +126,7 @@ def coding_agent(state: AgentState) -> AgentState:
             repo_path=state.get("repo_path", ""),
             chunks=relevant_code,
             language=state.get("language", ""),
+            max_targets=state.get("max_repair_files", 0),
         )
     except AdapterError as error:
         return AgentState(

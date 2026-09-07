@@ -36,6 +36,7 @@ __all__ = [
     "align_indentation",
     "diff_from_replacement",
     "select_target",
+    "select_targets",
 ]
 
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)(?:```|\Z)", re.DOTALL)
@@ -86,18 +87,52 @@ def select_target(
     chunks: Sequence[Mapping[str, Any]], language: str = ""
 ) -> TargetChunk:
     """Choose the one region to repair: the best match in the right language."""
+    targets = select_targets(chunks, language=language, max_targets=1)
+    if not targets:
+        raise RewriteError("No retrieved code to repair.")
+    return targets[0]
+
+
+def select_targets(
+    chunks: Sequence[Mapping[str, Any]],
+    language: str = "",
+    max_targets: int = 1,
+) -> list[TargetChunk]:
+    """Choose the regions to repair, best match first.
+
+    At most one region **per file**: two hunks in the same file would have to
+    be diffed together, because applying the first shifts the line numbers the
+    second was computed against.  One region per file keeps every diff
+    independently correct.
+
+    ``language`` only sets the *order* -- chunks in that language come first,
+    the rest follow.  A repository that implements the same function in
+    several languages (which is exactly when a caller asks for more than one
+    target) should still get all of them repaired.
+    """
     if not chunks:
         raise RewriteError("No retrieved code to repair.")
+
     wanted = (language or "").strip().lower()
-    if wanted:
-        preferred = [
-            chunk
-            for chunk in chunks
-            if str(chunk.get("language", "")).lower() == wanted
-        ]
-        if preferred:
-            return TargetChunk.from_mapping(preferred[0])
-    return TargetChunk.from_mapping(chunks[0])
+    preferred: list[Mapping[str, Any]] = []
+    others: list[Mapping[str, Any]] = []
+    for chunk in chunks:
+        if wanted and str(chunk.get("language", "")).lower() == wanted:
+            preferred.append(chunk)
+        else:
+            others.append(chunk)
+
+    targets: list[TargetChunk] = []
+    seen_files: set[str] = set()
+    for chunk in [*preferred, *others]:
+        target = TargetChunk.from_mapping(chunk)
+        if target.file in seen_files:
+            continue
+        seen_files.add(target.file)
+        targets.append(target)
+        if len(targets) >= max(1, max_targets):
+            break
+    return targets
 
 
 # --------------------------------------------------------------------------
