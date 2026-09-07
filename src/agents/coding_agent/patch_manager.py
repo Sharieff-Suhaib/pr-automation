@@ -117,16 +117,25 @@ def _git_apply(repo: Path, patch: str, check_only: bool) -> subprocess.Completed
     if check_only:
         command.append("--check")
     try:
-        return subprocess.run(
+        # The patch is written to Git as bytes, not text. In text mode Python
+        # rewrites every "\n" to os.linesep, so on Windows Git would receive a
+        # CRLF patch and reject it against LF source files.
+        result = subprocess.run(
             command,
             cwd=repo,
-            input=patch,
-            text=True,
+            input=patch.encode("utf-8"),
             capture_output=True,
             check=False,
         )
     except FileNotFoundError:
         return subprocess.CompletedProcess(command, 1, "", "git is not installed.")
+
+    return subprocess.CompletedProcess(
+        command,
+        result.returncode,
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def _command_error(result: subprocess.CompletedProcess[str]) -> str:

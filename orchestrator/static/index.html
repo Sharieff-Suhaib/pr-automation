@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Agent-SWE Orchestrator</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1c2024;
+    --muted: #6b7280;
+    --line: #e3e6ea;
+    --accent: #2f6feb;
+    --pass: #148a3c;
+    --fail: #c02626;
+    --skip: #8a8f98;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 20px 64px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+
+  header { margin-bottom: 24px; }
+  h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    margin: 0 0 14px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+  input[type=text], input[type=number], textarea {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    font: inherit;
+    background: #fff;
+    color: inherit;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  textarea { resize: vertical; min-height: 74px; }
+  .field { margin-bottom: 14px; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .check input { width: 15px; height: 15px; }
+
+  .actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; }
+  button {
+    padding: 9px 20px;
+    border: 0;
+    border-radius: 7px;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  button:hover { background: #2560d0; }
+  button:disabled { background: #a9b6c9; cursor: default; }
+  .note { font-size: 13px; color: var(--muted); }
+
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .banner .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .banner strong { font-size: 15px; }
+  .banner span.detail { color: var(--muted); font-size: 14px; }
+  .is-pass .dot { background: var(--pass); }
+  .is-fail .dot { background: var(--fail); }
+  .is-skip .dot { background: var(--skip); }
+  .is-pass strong { color: var(--pass); }
+  .is-fail strong { color: var(--fail); }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+  ul { margin: 0; padding-left: 18px; }
+  li { margin-bottom: 5px; }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .empty { color: var(--muted); font-style: italic; }
+
+  dl { margin: 0; }
+  dt { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 3px; }
+  dd { margin: 0 0 12px; }
+  dd:last-child { margin-bottom: 0; }
+
+  .bug { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .bug:last-child { border-bottom: 0; padding-bottom: 0; }
+  .bug .q { font-weight: 500; }
+  .bug .fix { color: var(--muted); font-size: 13.5px; }
+  .score { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+  pre {
+    margin: 0;
+    padding: 14px 16px;
+    background: #1e2227;
+    color: #d8dee9;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  pre .add { color: #8ddb9a; }
+  pre .del { color: #f19393; }
+  pre .hunk { color: #8ab4f8; }
+  pre .meta { color: #9aa3ad; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  td { padding: 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.agent { font-family: var(--mono); font-size: 12.5px; color: var(--accent); width: 190px; white-space: nowrap; }
+
+  .errors { border-color: #f0c7c7; background: #fdf6f6; }
+  .errors h2 { color: var(--fail); }
+  .errors li { color: #8f2323; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Agent-SWE Orchestrator</h1>
+    <p>Repository &rarr; Recommendation &rarr; Code Generation &rarr; Testing, in one LangGraph run.</p>
+  </header>
+
+  <form class="card" id="form">
+    <h2>Issue</h2>
+
+    <div class="field">
+      <label for="repo_url">Repository URL or local path</label>
+      <input type="text" id="repo_url" placeholder="https://github.com/owner/repo.git" required>
+    </div>
+
+    <div class="field">
+      <label for="issue">Issue</label>
+      <textarea id="issue" placeholder="Describe what is broken..." required></textarea>
+    </div>
+
+    <div class="row">
+      <div class="field" style="flex: 0 0 120px; margin-bottom: 0;">
+        <label for="top_k">Chunks (top-k)</label>
+        <input type="number" id="top_k" value="5" min="1" max="20">
+      </div>
+      <label class="check">
+        <input type="checkbox" id="offline">
+        Offline demo (bundled sample repo, fixture patch)
+      </label>
+    </div>
+
+    <div class="actions">
+      <button type="submit" id="run">Run workflow</button>
+      <span class="note" id="note"></span>
+    </div>
+  </form>
+
+  <div id="results"></div>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const esc = (value) =>
+  String(value === null || value === undefined ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const bullets = (items, cls) =>
+  items && items.length
+    ? '<ul class="' + (cls || "") + '">' + items.map((i) => "<li>" + esc(i) + "</li>").join("") + "</ul>"
+    : '<p class="empty">none</p>';
+
+let sample = null;
+
+async function loadSample() {
+  if (!sample) sample = await (await fetch("/sample")).json();
+  return sample;
+}
+
+// Ticking the offline box fills the form with the bundled demo, so the whole
+// pipeline can be run without a network and without a model.
+$("offline").addEventListener("change", async (event) => {
+  if (!event.target.checked) return;
+  const demo = await loadSample();
+  $("repo_url").value = demo.repo_url;
+  $("issue").value = demo.issue;
+});
+
+$("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  const offline = $("offline").checked;
+  const demo = offline ? await loadSample() : null;
+
+  const body = {
+    repo_url: $("repo_url").value,
+    issue: $("issue").value,
+    top_k: Number($("top_k").value) || 5,
+    codegen_backend: offline ? "stub" : "ollama",
+    stub_patch_path: offline ? demo.stub_patch_path : "",
+  };
+
+  $("run").disabled = true;
+  $("note").textContent = "Running... indexing and testing can take a minute.";
+  $("results").innerHTML = "";
+
+  try {
+    const response = await fetch("/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Request failed (" + response.status + ")");
+    render(data);
+  } catch (error) {
+    $("results").innerHTML =
+      '<div class="card errors"><h2>Request failed</h2><p>' + esc(error.message) + "</p></div>";
+  } finally {
+    $("run").disabled = false;
+    $("note").textContent = "";
+  }
+});
+
+function render(report) {
+  const test = report.test_result || {};
+  const passed = test.passed || 0;
+  const failed = test.failed || 0;
+  const state = report.test_status === "PASS" ? "is-pass"
+              : report.test_status === "FAIL" ? "is-fail"
+              : "is-skip";
+
+  let html =
+    '<div class="banner ' + state + '">' +
+      '<span class="dot"></span>' +
+      "<strong>" + esc(report.status.toUpperCase()) + "</strong>" +
+      '<span class="detail">patch ' + esc(report.patch_status) +
+        " &middot; tests " + esc(report.test_status) +
+        " (" + passed + " passed, " + failed + " failed)" +
+        " &middot; patch source: " + esc(report.patch_source) +
+      "</span>" +
+    "</div>";
+
+  if (report.errors && report.errors.length) {
+    html += '<div class="card errors"><h2>Errors</h2>' + bullets(report.errors) + "</div>";
+  }
+
+  html +=
+    '<div class="grid">' +
+      '<div class="card"><h2>Relevant files</h2>' + bullets(report.relevant_files, "mono") + "</div>" +
+      '<div class="card"><h2>Repair strategy</h2><dl>' +
+        "<dt>Bug type</dt><dd>" + (esc(report.bug_type) || '<span class="empty">unknown</span>') + "</dd>" +
+        "<dt>Strategy</dt><dd>" + (esc(report.strategy) || '<span class="empty">none</span>') + "</dd>" +
+        "<dt>Language</dt><dd>" + (esc(report.language) || '<span class="empty">unknown</span>') + "</dd>" +
+      "</dl></div>" +
+      '<div class="card"><h2>Recommended tools</h2>' + bullets(report.tools) + "</div>" +
+      '<div class="card"><h2>Recommended tests</h2>' + bullets(report.tests, "mono") + "</div>" +
+    "</div>";
+
+  const bugs = report.similar_bugs || [];
+  html +=
+    '<div class="card"><h2>Similar bugs</h2>' +
+    (bugs.length
+      ? bugs.map((bug) =>
+          '<div class="bug"><div class="q">' + esc(bug.issue) +
+          ' <span class="score">' + esc(bug.similarity) + "</span></div>" +
+          '<div class="fix">previous fix: ' + esc(bug.fix) + "</div></div>"
+        ).join("")
+      : '<p class="empty">none</p>') +
+    "</div>";
+
+  html +=
+    '<div class="card"><h2>Patch</h2>' +
+    (report.patch ? "<pre>" + colourDiff(report.patch) + "</pre>" : '<p class="empty">no patch generated</p>') +
+    "</div>";
+
+  html +=
+    '<div class="card"><h2>Test run</h2><dl><dt>Changed files</dt><dd class="mono">' +
+    (esc((report.changed_files || []).join(", ")) || '<span class="empty">none</span>') +
+    "</dd></dl>" +
+    (test.errors && test.errors.length ? bullets(test.errors) : "") +
+    (test.output ? "<pre>" + esc(test.output) + "</pre>" : "") +
+    "</div>";
+
+  html +=
+    '<div class="card"><h2>Trace</h2><table>' +
+    (report.trace || []).map((entry) =>
+      '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"
+    ).join("") +
+    "</table></div>";
+
+  $("results").innerHTML = html;
+}
+
+// Colour a unified diff: file headers, hunk headers, additions, removals.
+function colourDiff(patch) {
+  return patch.split("\n").map((line) => {
+    const text = esc(line);
+    if (line.indexOf("+++") === 0 || line.indexOf("---") === 0) return '<span class="meta">' + text + "</span>";
+    if (line.indexOf("@@") === 0) return '<span class="hunk">' + text + "</span>";
+    if (line.charAt(0) === "+") return '<span class="add">' + text + "</span>";
+    if (line.charAt(0) === "-") return '<span class="del">' + text + "</span>";
+    return text;
+  }).join("\n");
+}
+</script>
+</body>
+</html>

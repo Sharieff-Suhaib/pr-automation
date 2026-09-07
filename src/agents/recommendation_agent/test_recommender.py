@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from src.agents.codegen_agent import DEFAULT_MODEL, OllamaError, call_ollama
+from src.agents.codegen_agent  import DEFAULT_MODEL, OllamaError, call_ollama
 
 SYSTEM_PROMPT = (
     "You are a QA engineer. Based on the issue and the relevant code, list the "

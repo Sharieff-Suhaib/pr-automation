@@ -1,0 +1,19 @@
+--- a/users.py
++++ b/users.py
+@@ -2,11 +2,15 @@
+ 
+ 
+ def get_user(users, name):
+-    """Return the profile stored for `name`."""
++    """Return the profile stored for `name`, or None when it is not registered."""
++    if name not in users:
++        return None
+     return users[name]
+ 
+ 
+ def login(users, name, password):
+     """Return True when `name` exists and the password matches."""
+     user = get_user(users, name)
++    if user is None:
++        return False
+     return user["password"] == password

@@ -10,3 +10,8 @@ data/processed/*
 !data/processed/humanevalfix_base.json
 
 src/agents/repository-agent/repositories/
+
+# Cloned repositories and the throwaway working copies each repair run patches.
+repositories/
+workspaces/
+.pytest_cache/
