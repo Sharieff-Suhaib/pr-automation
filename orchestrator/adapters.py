@@ -152,9 +152,27 @@ def analyze_repository(repo_url: str, issue: str, top_k: int = DEFAULT_TOP_K) ->
         "repo_path": repo_path,
         "relevant_code": results,
         "relevant_files": _unique([result["file"] for result in results]),
-        "language": results[0]["language"] if results else "",
+        "language": _dominant_language(results),
         "indexed_chunks": len(chunks),
     }
+
+
+def _dominant_language(results: list[dict[str, Any]]) -> str:
+    """The language most of the top matches are written in.
+
+    Taking `results[0]` instead would let one marginally better match in
+    another language decide the language of the whole repair.
+    """
+    if not results:
+        return ""
+    counts: dict[str, int] = {}
+    for result in results:
+        language = str(result.get("language", "")).lower()
+        if language:
+            counts[language] = counts.get(language, 0) + 1
+    if not counts:
+        return ""
+    return max(counts, key=lambda name: counts[name])
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +222,7 @@ def generate_patch(
     tests: list[str],
     backend: str = "ollama",
     stub_patch_path: str = "",
+    repo_path: str = "",
 ) -> tuple[str, str]:
     """Return `(unified_diff, source)` for the repair.
 
@@ -230,6 +249,7 @@ def generate_patch(
             strategy=strategy,
             tools=tools,
             tests=tests,
+            repo_path=repo_path or None,
         )
     except PatchGenerationError as error:
         raise AdapterError(str(error)) from error
@@ -244,19 +264,49 @@ def _load_stub_patch(stub_patch_path: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def format_relevant_code(relevant_code: list[dict[str, Any]], limit: int = 3) -> str:
+def format_relevant_code(
+    relevant_code: list[dict[str, Any]],
+    limit: int = 3,
+    language: str = "",
+) -> str:
     """Render retrieved chunks for the repair prompt, keeping the file paths visible.
 
     The model has to emit `--- a/<file>` headers, so the path of each chunk is
     stated right above its code.
+
+    `language` restricts the chunks to one language. Sample repositories often
+    implement the same function in Java, Python and C++, and retrieval happily
+    returns all of them for a single issue; without this filter the model tries
+    to patch every copy, producing a cross-language diff for a one-language
+    bug. Retrieval still reports everything it found -- only the repair brief
+    is narrowed.
     """
+    chunks = filter_by_language(relevant_code, language)
     blocks = []
-    for chunk in relevant_code[:limit]:
+    for chunk in chunks[:limit]:
         blocks.append(
             f"File: {chunk['file']} (lines {chunk['start_line']}-{chunk['end_line']}, "
             f"{chunk['type']} {chunk['name']})\n{chunk['code']}"
         )
     return "\n\n".join(blocks)
+
+
+def filter_by_language(
+    relevant_code: list[dict[str, Any]], language: str
+) -> list[dict[str, Any]]:
+    """Keep only the chunks written in `language`, preserving their order.
+
+    An unknown or empty language, or a language matching nothing, leaves the
+    list untouched: narrowing to zero chunks would be worse than not narrowing
+    at all.
+    """
+    if not language:
+        return relevant_code
+    wanted = language.strip().lower()
+    matching = [
+        chunk for chunk in relevant_code if str(chunk.get("language", "")).lower() == wanted
+    ]
+    return matching or relevant_code
 
 
 # --------------------------------------------------------------------------

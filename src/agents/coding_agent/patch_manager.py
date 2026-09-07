@@ -7,6 +7,12 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 
+from src.agents.coding_agent.diff_validator import (
+    DiffError,
+    describe_diff_error,
+    validate_unified_diff,
+)
+
 
 @dataclass
 class PatchResult:
@@ -81,27 +87,45 @@ def _copy_repository(source: Path, destination: Path) -> None:
 
 
 def _changed_files(patch: str) -> list[str]:
-    """Return patched files and reject paths that could escape the repository."""
-    if not patch.strip():
-        raise ValueError("Patch is empty.")
+    """Return patched files and reject paths that could escape the repository.
+
+    The diff is fully parsed first, so a malformed patch is reported in terms
+    of the mistake ("a file header must be a path...") rather than as Git's
+    ``corrupt patch at line N``, which counts from where Git lost track.
+    """
+    try:
+        files = validate_unified_diff(patch)
+    except DiffError as error:
+        raise ValueError(describe_diff_error(error, patch)) from error
 
     paths: list[str] = []
-    for line in patch.splitlines():
-        if not line.startswith(("--- ", "+++ ")):
-            continue
-
-        path = line[4:].split("\t", maxsplit=1)[0].strip()
-        if path == "/dev/null":
-            continue
-        if path.startswith(("a/", "b/")):
-            path = path[2:]
-        _validate_relative_path(path)
-        if path not in paths:
-            paths.append(path)
-
-    if not paths or "\n+++ " not in patch:
-        raise ValueError("Patch must contain --- and +++ file headers.")
+    for file_diff in files:
+        for raw in (file_diff.old_path, file_diff.new_path):
+            if raw == "/dev/null":
+                continue
+            path = raw[2:] if raw.startswith(("a/", "b/")) else raw
+            _validate_relative_path(path)
+            if path not in paths:
+                paths.append(path)
     return paths
+
+
+def check_patch(repo: str | Path, patch: str) -> tuple[bool, str]:
+    """Ask Git whether ``patch`` would apply to ``repo``, changing nothing.
+
+    Used by the code generator to turn a rejected patch into a retry with the
+    real reason attached, instead of failing the whole run.  Returns
+    ``(ok, error)``; ``error`` is empty when the patch would apply.
+    """
+    try:
+        _changed_files(patch)
+    except ValueError as error:
+        return (False, str(error))
+
+    result = _git_apply(Path(repo), patch, check_only=True)
+    if result.returncode != 0:
+        return (False, _command_error(result))
+    return (True, "")
 
 
 def _validate_relative_path(path: str) -> None:

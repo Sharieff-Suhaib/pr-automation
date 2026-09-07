@@ -66,7 +66,9 @@ def repository_agent(state: AgentState) -> AgentState:
 def recommendation_agent(state: AgentState) -> AgentState:
     """Member 2: similar bugs -> repair strategy -> tools -> tests."""
     issue = state.get("issue", "")
-    code = adapters.format_relevant_code(state.get("relevant_code", []))
+    code = adapters.format_relevant_code(
+        state.get("relevant_code", []), language=state.get("language", "")
+    )
 
     try:
         result = adapters.recommend(issue, code=code, language=state.get("language") or "python")
@@ -112,13 +114,16 @@ def coding_agent(state: AgentState) -> AgentState:
     try:
         patch, source = adapters.generate_patch(
             issue=state.get("issue", ""),
-            relevant_code=adapters.format_relevant_code(relevant_code),
+            relevant_code=adapters.format_relevant_code(
+                relevant_code, language=state.get("language", "")
+            ),
             similar_bugs=state.get("similar_bugs", []),
             strategy=state.get("strategy", ""),
             tools=state.get("tools", []),
             tests=state.get("tests", []),
             backend=state.get("codegen_backend", "ollama"),
             stub_patch_path=state.get("stub_patch_path", ""),
+            repo_path=state.get("repo_path", ""),
         )
     except AdapterError as error:
         return AgentState(
