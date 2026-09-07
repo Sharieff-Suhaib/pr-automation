@@ -90,20 +90,34 @@ model:
     task_type: CAUSAL_LM
 
 training:
-  epochs: 3
+  # Defaults are the hyper-parameters the RepairLLaMA paper reports.  Matching
+  # them is not the same as reproducing the paper's results — see the README.
+  epochs: 2                # paper
+  max_steps: 0             # 0 = train for `epochs`; >0 overrides it
   batch_size: 4
+  eval_batch_size: 0       # 0 = same as batch_size
   gradient_accumulation_steps: 8
-  learning_rate: 0.0002
+  learning_rate: 0.0005    # paper: 5e-4
+  optimizer: adamw_torch   # paper: AdamW
   weight_decay: 0.0
   warmup_ratio: 0.03
-  lr_scheduler: cosine     # linear | cosine | constant | constant_with_warmup
+  lr_scheduler: cosine     # paper: cosine | linear | constant | constant_with_warmup
   max_grad_norm: 1.0
+  max_length: 1024         # paper: prompt + completion, in tokens
+  mixed_precision: auto    # auto | no | fp16 | bf16
   gradient_checkpointing: true
+  group_by_length: false   # batch similar lengths together (less padding)
+  dataloader_num_workers: 0
   seed: 42
   logging_steps: 10
+  eval_strategy: steps     # no | steps | epoch
   eval_steps: 200
+  save_strategy: steps     # no | steps | epoch
   save_steps: 200
   save_total_limit: 3
+  load_best_model_at_end: false
+  early_stopping_patience: 0   # 0 = disabled
+  report_to: "none"        # none | tensorboard | wandb | ...
   resume_from_checkpoint: ""
 
 inference:

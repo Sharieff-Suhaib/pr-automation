@@ -41,7 +41,7 @@ def test_dotted_override(default_config: RepairConfig) -> None:
     updated = default_config.override({"training.epochs": 7, "model.lora.r": 32})
     assert updated.training.epochs == 7
     assert updated.model.lora.r == 32
-    assert default_config.training.epochs == 3, "override must not mutate the original"
+    assert default_config.training.epochs == 2, "override must not mutate the original"
 
 
 def test_unknown_override_key_rejected(default_config: RepairConfig) -> None:

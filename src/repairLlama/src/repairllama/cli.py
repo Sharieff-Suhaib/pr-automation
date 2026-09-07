@@ -5,7 +5,8 @@
     repairllama init
     repairllama prepare-data --set data.max_examples=500
 
-``config``, ``init``, ``prepare-data`` and ``model-check`` do real work today.  The remaining
+``config``, ``init``, ``prepare-data``, ``model-check`` and ``train`` do real
+work today.  The remaining
 pipeline stages resolve their configuration, log the plan they would execute
 and then exit with :data:`EXIT_NOT_IMPLEMENTED` until that phase lands, which
 keeps the argument surface stable while the stages are filled in one at a
@@ -20,7 +21,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from repairllama import __version__
-from repairllama.config import ConfigError, RepairConfig, load_config
+from repairllama.config import (
+    ConfigError,
+    RepairConfig,
+    load_config,
+    parse_override_value,
+)
 from repairllama.utils.logging import configure_from_config, get_logger, log_section
 from repairllama.utils.paths import default_config_path
 from repairllama.utils.seed import set_seed
@@ -45,11 +51,11 @@ class StageNotImplemented(NotImplementedError):
 def _parse_overrides(pairs: Optional[Sequence[str]]) -> Dict[str, Any]:
     """Turn ``["training.epochs=5", "model.device=cpu"]`` into a dict.
 
-    Values are parsed as YAML scalars, so ``5`` becomes an int and ``true``
-    a bool, matching what the same key would mean in the config file.
+    Values are parsed as YAML scalars, so ``5`` becomes an int and ``true`` a
+    bool, matching what the same key would mean in the config file — except
+    that ``no``/``yes``/``on``/``off`` stay strings, since several settings
+    take them as values.
     """
-    import yaml
-
     overrides: Dict[str, Any] = {}
     for pair in pairs or []:
         if "=" not in pair:
@@ -58,7 +64,7 @@ def _parse_overrides(pairs: Optional[Sequence[str]]) -> Dict[str, Any]:
         key = key.strip()
         if not key:
             raise ConfigError(f"--set expects key=value, got {pair!r}")
-        overrides[key] = yaml.safe_load(raw)
+        overrides[key] = parse_override_value(raw)
     return overrides
 
 
@@ -194,9 +200,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_localize.add_argument("--project", default=None, help="path to a Java project")
     p_localize.set_defaults(func=cmd_localize)
 
-    p_train = subparsers.add_parser("train", help="fine-tune the repair model")
+    p_train = subparsers.add_parser(
+        "train", help="fine-tune the Java repair LoRA adapter"
+    )
     _add_common_args(p_train)
-    p_train.add_argument("--resume", default=None, help="checkpoint directory to resume from")
+    p_train.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="resume: 'auto' for the newest checkpoint, or a checkpoint path",
+    )
+    p_train.add_argument("--splits-dir", default=None, help="where the JSONL splits live")
+    p_train.add_argument("--adapters-dir", default=None, help="parent of java-repair/")
+    p_train.add_argument(
+        "--max-examples", type=int, default=0, help="cap training rows (0 = all)"
+    )
+    p_train.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="set everything up and print the banner without training",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_infer = subparsers.add_parser("infer", help="generate candidate patches for a bug")
@@ -607,22 +631,35 @@ def cmd_localize(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
+    from repairllama.model.loader import ModelError, ModelNotAvailableError
+    from repairllama.training import TrainingError, run_training
+
     cfg = _resolve_config(args)
     set_seed(cfg.training.seed)
-    _stage_banner(
-        cfg,
-        "train",
-        {
-            "base model": cfg.model.base_model,
-            "lora": "enabled" if cfg.model.lora.enabled else "disabled",
-            "epochs": cfg.training.epochs,
-            "effective batch": cfg.training.effective_batch_size,
-            "learning rate": cfg.training.learning_rate,
-            "adapters dir": cfg.paths.resolve("adapters_dir"),
-            "resume from": args.resume or cfg.training.resume_from_checkpoint or "(none)",
-        },
-    )
-    return _not_implemented("train", "repairllama.training")
+    try:
+        result = run_training(
+            cfg,
+            splits_dir=args.splits_dir,
+            adapters_dir=args.adapters_dir,
+            resume=args.resume,
+            dry_run=args.dry_run,
+            max_examples=args.max_examples,
+        )
+    except ModelNotAvailableError as exc:
+        log.error("%s", exc)
+        return EXIT_MODEL_UNAVAILABLE
+    except (TrainingError, ModelError) as exc:
+        log.error("%s", exc)
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        log.warning("interrupted; resume with --resume auto")
+        return 130
+
+    if args.dry_run:
+        log.info("dry run complete — nothing was trained")
+        return EXIT_OK
+    log.info("adapter written to %s", result.artifact_dir)
+    return EXIT_OK
 
 
 def cmd_infer(args: argparse.Namespace) -> int:

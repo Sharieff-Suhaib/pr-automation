@@ -81,7 +81,6 @@ def test_init_dry_run_creates_nothing(tmp_path: Path, config_path: Path) -> None
     "argv",
     [
         ["localize"],
-        ["train"],
         ["infer"],
         ["patch"],
         ["evaluate"],
@@ -332,3 +331,57 @@ def test_model_check_reports_a_bad_adapter_path(
     )
     assert code == cli.EXIT_USAGE
     assert "adapter directory not found" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# train
+# --------------------------------------------------------------------------- #
+def test_train_is_listed(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        _run(["--help"])
+    assert "train" in capsys.readouterr().out
+
+
+def test_train_reports_a_missing_dataset(
+    config_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checkpoint = _tiny_checkpoint(tmp_path)
+    code = _run(
+        ["train", "-c", str(config_path), "--no-log-file", "--dry-run",
+         "--set", f"model.base_model={checkpoint}", "--set", "model.device=cpu",
+         "--splits-dir", str(tmp_path / "no-splits")]
+    )
+    assert code == cli.EXIT_USAGE
+    assert "prepare-data" in capsys.readouterr().err
+
+
+def test_train_dry_run_prints_the_banner(
+    config_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    checkpoint = _tiny_checkpoint(tmp_path)
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    rows = [
+        {"input": "public int f() {\n<FILL_ME>\n}", "output": "return a;"}
+        for _ in range(4)
+    ]
+    for name in ("train", "validation"):
+        (splits / f"{name}.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+        )
+
+    code = _run(
+        ["train", "-c", str(config_path), "--no-log-file", "--dry-run",
+         "--set", f"model.base_model={checkpoint}", "--set", "model.device=cpu",
+         "--set", "model.dtype=float32", "--set", "training.max_length=64",
+         "--splits-dir", str(splits), "--adapters-dir", str(tmp_path / "adapters")]
+    )
+    assert code == cli.EXIT_OK
+    err = capsys.readouterr().err
+    for label in ("Base parameters:", "Trainable parameters:", "Trainable percentage:",
+                  "Dataset size:", "Max sequence length:", "Batch size:",
+                  "Learning rate:", "LoRA configuration:"):
+        assert label in err
+    assert not (tmp_path / "adapters" / "java-repair" / "adapter_model.safetensors").exists()

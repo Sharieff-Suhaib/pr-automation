@@ -39,6 +39,7 @@ REQUIRED_FILES = [
     "README.md",
     ".gitignore",
     "configs/java_repair.yaml",
+    "scripts/train_java_repair.py",
 ]
 
 MODULES = [
@@ -64,6 +65,10 @@ MODULES = [
     "repairllama.model.adapter",
     "repairllama.model.lora",
     "repairllama.training",
+    "repairllama.training.collator",
+    "repairllama.training.metrics",
+    "repairllama.training.checkpoint",
+    "repairllama.training.trainer",
     "repairllama.inference",
     "repairllama.patching",
     "repairllama.evaluation",
