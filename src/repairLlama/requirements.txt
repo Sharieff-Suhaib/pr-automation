@@ -1,0 +1,31 @@
+# RepairLLaMA-Java dependencies.
+#
+#   pip install -r requirements.txt      # everything below
+#   pip install -e .                     # runtime (PyYAML) + the CLI only
+#
+# torch has no wheels for Python 3.13+ yet — use Python 3.10-3.12.
+
+# --- core runtime (needed to import the package and run the CLI) ----------
+PyYAML>=6.0
+
+# --- model / fine-tuning stack --------------------------------------------
+torch>=2.3
+transformers>=4.45
+datasets>=2.20
+peft>=0.12
+trl>=0.9
+accelerate>=0.33
+
+# 4-bit QLoRA. CUDA-only: on macOS/CPU the pipeline falls back to plain LoRA.
+bitsandbytes>=0.43 ; platform_system == "Linux" or platform_system == "Windows"
+
+# --- Java parsing / diff handling -----------------------------------------
+tree-sitter==0.20.4
+tree-sitter-languages==1.10.2
+unidiff>=0.7
+GitPython>=3.1.43
+
+# --- development ----------------------------------------------------------
+pytest>=7.4
+pytest-cov>=4.1
+ruff>=0.5

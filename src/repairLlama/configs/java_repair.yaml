@@ -1,0 +1,156 @@
+# RepairLLaMA-Java — default pipeline configuration.
+#
+# Every key here mirrors a field of repairllama.config.RepairConfig; unknown
+# keys are rejected at load time.  Override single values from the CLI with
+#   repairllama <command> --set training.epochs=5 --set model.device=cpu
+#
+# Validate after editing:  repairllama config validate
+
+experiment_name: java-repair
+seed: 42
+
+paths:
+  # Relative paths resolve against the project root (the directory holding
+  # pyproject.toml), not the current working directory.
+  project_root: "."
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  splits_dir: data/splits
+  models_dir: models
+  adapters_dir: adapters        # <adapters_dir>/java-repair, python-repair, ...
+  output_dir: outputs
+  log_dir: outputs/logs
+
+data:
+  dataset_name: megadiff-java
+  language: java
+  max_examples: 0          # 0 = no cap
+  train_split: 0.9
+  val_split: 0.05
+  test_split: 0.05
+  shuffle_seed: 42
+  min_diff_lines: 1
+  max_diff_lines: 50
+  drop_test_only_changes: true
+  require_single_function: true   # the paper's rule: one function per fix
+  deduplicate: true
+  dedup_strategy: normalized      # exact | normalized | input_only
+  split_by_project: true          # keep a project's examples in one split
+  minimal_records: false          # true = emit only {"input", "output"}
+  use_model_tokenizer: false      # true = count tokens with model.tokenizer
+  loader_format: jsonl            # jsonl | json | directory
+
+representation:
+  # Input/output representations from the RepairLLaMA study.
+  #   ir1  buggy function, unannotated
+  #   ir2  buggy function with the buggy lines marked by comments
+  #   ir3  buggy lines removed, replaced by the fill token
+  #   ir4  buggy lines kept but commented out, marked, plus the fill token
+  #   or1  the whole fixed function
+  #   or2  only the replacement code for the suspicious region
+  # Implemented pair: ir4 x or2.
+  input_format: ir4
+  output_format: or2
+  fill_token: "<FILL_ME>"
+  region_start_marker: "// buggy lines start here"
+  region_end_marker: "// buggy lines end here"
+  comment_prefix: "//"
+  context_lines: 10          # lines kept on each side of the region; 0 = none
+  show_line_numbers: false   # prefix prompt lines with their 1-based number
+  include_file_path: true
+  include_test_failure: false
+  dedent_target: false       # keep the target's original indentation
+  max_input_tokens: 1024
+  max_output_tokens: 512
+
+localization:
+  strategy: perfect        # perfect | stacktrace | spectrum
+  granularity: hunk        # line | hunk | function | file
+  max_candidates: 5
+
+model:
+  base_model: codellama/CodeLlama-7b-hf
+  tokenizer: ""            # empty = same as base_model
+  revision: main
+  dtype: auto              # auto | float16 | bfloat16 | float32
+  device: auto             # auto | cpu | cuda | mps | cuda:<index>
+  load_in_4bit: false      # requires bitsandbytes + CUDA
+  trust_remote_code: false
+  allow_download: false    # true = let transformers fetch the checkpoint (GBs)
+  padding_side: right      # right for training, left for batched generation
+  adapter_path: ""         # empty = base model only
+  lora:
+    # The RepairLLaMA paper's reported configuration.
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules: [q_proj, v_proj]
+    bias: none
+    task_type: CAUSAL_LM
+
+training:
+  # Defaults are the hyper-parameters the RepairLLaMA paper reports.  Matching
+  # them is not the same as reproducing the paper's results — see the README.
+  epochs: 2                # paper
+  max_steps: 0             # 0 = train for `epochs`; >0 overrides it
+  batch_size: 4
+  eval_batch_size: 0       # 0 = same as batch_size
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0005    # paper: 5e-4
+  optimizer: adamw_torch   # paper: AdamW
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler: cosine     # paper: cosine | linear | constant | constant_with_warmup
+  max_grad_norm: 1.0
+  max_length: 1024         # paper: prompt + completion, in tokens
+  mixed_precision: auto    # auto | no | fp16 | bf16
+  gradient_checkpointing: true
+  group_by_length: false   # batch similar lengths together (less padding)
+  dataloader_num_workers: 0
+  seed: 42
+  logging_steps: 10
+  eval_strategy: steps     # no | steps | epoch
+  eval_steps: 200
+  save_strategy: steps     # no | steps | epoch
+  save_steps: 200
+  save_total_limit: 3
+  load_best_model_at_end: false
+  early_stopping_patience: 0   # 0 = disabled
+  report_to: "none"        # none | tensorboard | wandb | ...
+  resume_from_checkpoint: ""
+
+inference:
+  num_candidates: 10
+  max_new_tokens: 256
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 50
+  do_sample: true
+  num_beams: 1
+  batch_size: 1
+  stop_sequences: []
+  deduplicate: true
+
+patching:
+  strategy: hunk_replace   # hunk_replace | full_function | unified_diff
+  validate_syntax: true
+  normalize_whitespace: true
+  keep_original_indentation: true
+  backup_originals: true
+  max_patch_size_lines: 200
+
+evaluation:
+  build_tool: maven        # maven | gradle | none
+  test_command: ""         # empty = derived from build_tool
+  test_timeout_seconds: 600
+  compile_only: false
+  metrics: [compilable, plausible, exact_match]
+  report_path: outputs/reports/evaluation.json
+
+logging:
+  level: INFO              # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  format: text             # text | json
+  log_to_file: true
+  file_name: repairllama.log
+  color: true

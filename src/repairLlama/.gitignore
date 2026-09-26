@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights and adapters — never commit checkpoints.
+models/*
+!models/.gitkeep
+adapters/**/*
+!adapters/*/.gitkeep
+
+# Datasets — regenerate with `repairllama prepare-data`.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/splits/*
+!data/splits/.gitkeep
+
+# Run artefacts
+outputs/
+*.log
+
+# OS
+.DS_Store
