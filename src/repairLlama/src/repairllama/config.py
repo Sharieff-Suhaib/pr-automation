@@ -24,6 +24,7 @@ import yaml
 
 __all__ = [
     "ConfigError",
+    "parse_override_value",
     "PathsConfig",
     "DataConfig",
     "RepresentationConfig",
@@ -45,6 +46,29 @@ class ConfigError(ValueError):
 
 
 T = TypeVar("T")
+
+# YAML 1.1 reads `no`, `yes`, `on` and `off` as booleans, which silently
+# breaks `--set training.eval_strategy=no` and `--set model.dtype=off`-style
+# values.  Only `true`/`false` are treated as booleans here; the other words
+# stay the strings the user typed.
+_BOOL_WORDS = {"true": True, "false": False}
+_YAML_BOOL_LOOKALIKES = {"no", "yes", "on", "off", "y", "n"}
+
+
+def parse_override_value(raw: str) -> Any:
+    """Parse a ``--set key=value`` value as a YAML scalar, minus the traps.
+
+    ``5`` becomes an int and ``true`` a bool, matching what the same text
+    would mean in the config file — but ``no`` stays the string ``"no"``,
+    because several settings take it as a legitimate value.
+    """
+    text = raw.strip()
+    lowered = text.lower()
+    if lowered in _BOOL_WORDS:
+        return _BOOL_WORDS[lowered]
+    if lowered in _YAML_BOOL_LOOKALIKES:
+        return text
+    return yaml.safe_load(raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,32 +357,55 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """Supervised fine-tuning hyper-parameters (not yet implemented)."""
+    """Supervised fine-tuning hyper-parameters.
 
-    epochs: int = 3
+    The defaults are the settings the RepairLLaMA paper reports: 2 epochs of
+    AdamW at 5e-4 with a cosine schedule, sequences of 1024 tokens.  Matching
+    the reported hyper-parameters is not the same as reproducing the reported
+    results, which also depend on the corpus, the hardware and details the
+    paper does not report — see the README.
+    """
+
+    epochs: int = 2
+    max_steps: int = 0  # 0 == train for `epochs`
     batch_size: int = 4
+    eval_batch_size: int = 0  # 0 == same as batch_size
     gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-4
+    learning_rate: float = 5e-4
+    optimizer: str = "adamw_torch"
     weight_decay: float = 0.0
     warmup_ratio: float = 0.03
     lr_scheduler: str = "cosine"
     max_grad_norm: float = 1.0
+    max_length: int = 1024  # prompt + completion, in tokens
+    mixed_precision: str = "auto"  # auto | no | fp16 | bf16
     gradient_checkpointing: bool = True
+    group_by_length: bool = False
+    dataloader_num_workers: int = 0
     seed: int = 42
     logging_steps: int = 10
+    eval_strategy: str = "steps"  # no | steps | epoch
     eval_steps: int = 200
+    save_strategy: str = "steps"  # no | steps | epoch
     save_steps: int = 200
     save_total_limit: int = 3
+    load_best_model_at_end: bool = False
+    early_stopping_patience: int = 0  # 0 == disabled
+    report_to: str = "none"
     resume_from_checkpoint: str = ""
 
     def __post_init__(self) -> None:
         _positive(self.epochs, "training.epochs")
+        _non_negative(self.max_steps, "training.max_steps")
         _positive(self.batch_size, "training.batch_size")
+        _non_negative(self.eval_batch_size, "training.eval_batch_size")
         _positive(
             self.gradient_accumulation_steps, "training.gradient_accumulation_steps"
         )
         _positive(self.learning_rate, "training.learning_rate")
         _non_negative(self.weight_decay, "training.weight_decay")
+        _positive(self.max_length, "training.max_length")
+        _non_negative(self.early_stopping_patience, "training.early_stopping_patience")
         _require(
             0.0 <= self.warmup_ratio <= 1.0,
             f"training.warmup_ratio: expected [0, 1], got {self.warmup_ratio!r}",
@@ -368,10 +415,28 @@ class TrainingConfig:
             ["linear", "cosine", "constant", "constant_with_warmup"],
             "training.lr_scheduler",
         )
+        _one_of(
+            self.optimizer,
+            ["adamw_torch", "adamw_torch_fused", "adamw_hf", "adafactor", "sgd"],
+            "training.optimizer",
+        )
+        _one_of(
+            self.mixed_precision, ["auto", "no", "fp16", "bf16"], "training.mixed_precision"
+        )
+        for key in ("eval_strategy", "save_strategy"):
+            _one_of(getattr(self, key), ["no", "steps", "epoch"], f"training.{key}")
+        _require(
+            not self.load_best_model_at_end or self.eval_strategy != "no",
+            "training: load_best_model_at_end needs eval_strategy 'steps' or 'epoch'",
+        )
 
     @property
     def effective_batch_size(self) -> int:
         return self.batch_size * self.gradient_accumulation_steps
+
+    @property
+    def eval_batch(self) -> int:
+        return self.eval_batch_size or self.batch_size
 
 
 @dataclass

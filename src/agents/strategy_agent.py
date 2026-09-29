@@ -3,9 +3,10 @@
 Answers: *what kind of fix does this issue call for?*
 
 Classifies the issue into a repair category, which is injected into the repair
-prompt to steer generation. STAGE A returns a keyword-based guess; STAGE D
-replaces it with a structured LLM prompt (keeping this as the fallback when the
-LLM is unavailable or returns an unparseable label).
+prompt to steer generation. `recommend` below delegates to
+recommendation_agent.strategy_recommender, a structured LLM prompt; the
+keyword-based `classify`/STRATEGIES in this module are its fallback when the
+LLM is unavailable or returns an unparseable label.
 """
 
 from __future__ import annotations
@@ -46,9 +47,17 @@ def classify(text: str) -> str:
 
 def recommend(state: AgentState) -> AgentState:
     """Recommend a repair strategy for the issue."""
-    strategy = classify(state["issue"].as_text())
+    # Deferred import: strategy_recommender imports `classify`/STRATEGIES from
+    # this module for its own fallback, so importing it at module load time
+    # here would be circular.
+    from src.agents.recommendation_agent.strategy_recommender import recommend as recommend_strategy
+
+    issue_text = state["issue"].as_text()
+    code = "\n\n".join(chunk.source for chunk in state.get("relevant_chunks", []))
+    result = recommend_strategy(issue_text, code=code, similar_bugs=state.get("similar_bugs", []))
+
     return AgentState(
-        repair_strategy=strategy,
-        strategy_rationale=STRATEGIES[strategy],
-        trace=[trace_entry("strategy_agent", f"strategy={strategy}")],
+        repair_strategy=result.bug_type,
+        strategy_rationale=result.strategy,
+        trace=[trace_entry("strategy_agent", f"strategy={result.bug_type} (source={result.source})")],
     )

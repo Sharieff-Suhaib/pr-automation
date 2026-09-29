@@ -6,14 +6,13 @@ on bug/fix pairs, prompted with a *code representation* that marks exactly
 where the bug is, and evaluated by actually compiling and testing the patches
 it produces.
 
-**Status: everything up to training is in place; no training loop yet.** The
+**Status: trainable end to end; inference and evaluation still to come.** The
 package layout, configuration schema, logging utilities, CLI, the IR4 × OR2 code
-representation, the dataset pipeline, the model-loading layer and the Java
-LoRA adapter are
-implemented — `prepare-data` produces real JSONL splits, `model-check` is a dry
-run of the model stack, and the Java LoRA adapter (the paper's r=8 / q_proj +
-v_proj configuration) attaches, saves and reloads. Nothing is downloaded automatically. The remaining
-stages (`localize`, `train`, `infer`, `patch`, `evaluate`) validate their
+representation, the dataset pipeline, the model layer and LoRA fine-tuning are
+implemented: `prepare-data` produces JSONL splits, `model-check` dry-runs the
+model stack, and `train` fine-tunes the adapter and writes it to
+`adapters/java-repair/`. Nothing is downloaded automatically. The remaining
+stages (`localize`, `infer`, `patch`, `evaluate`) validate their
 configuration, log the plan they would run, and exit with code `2`
 (`not implemented`).
 
@@ -51,7 +50,11 @@ repairllama-java/
 │   │   ├── loader.py        find a checkpoint locally, load the base LM
 │   │   ├── adapter.py       attach / load / save / unload LoRA (generic)
 │   │   └── lora.py          the Java repair adapter (the paper's config)
-│   ├── training/            supervised fine-tuning        (later phase)
+│   ├── training/            supervised fine-tuning
+│   │   ├── collator.py      IR4/OR2 rows -> masked batches
+│   │   ├── metrics.py       validation loss, perplexity, accuracies
+│   │   ├── checkpoint.py    resuming, and the final adapter artifact
+│   │   └── trainer.py       the loop
 │   ├── inference/           candidate patch generation
 │   ├── patching/            splice a hunk back into source
 │   ├── evaluation/          compile / test / score
@@ -386,6 +389,96 @@ Exit codes: `0` all checks passed, `1` a check or the configuration failed,
 `3` no local checkpoint (with instructions). Nothing is trained and no weights
 are written.
 
+## Training
+
+```bash
+repairllama train                                   # config defaults
+repairllama train --dry-run                         # set up, print the banner, stop
+python scripts/train_java_repair.py --epochs 2 --lr 5e-4
+python scripts/train_java_repair.py --resume auto   # newest checkpoint
+```
+
+Both entry points take the same settings; every one of them lives in
+`configs/java_repair.yaml` and can be overridden with `--set key=value`.
+
+### Defaults
+
+| Setting | Value |
+| --- | --- |
+| `learning_rate` | 5e-4 |
+| `lr_scheduler` | cosine |
+| `epochs` | 2 |
+| `optimizer` | AdamW (`adamw_torch`) |
+| `max_length` | 1024 |
+| LoRA | r=8, alpha=16, dropout=0.05, `q_proj` + `v_proj` |
+
+Also configurable: `mixed_precision` (auto/no/fp16/bf16),
+`gradient_accumulation_steps`, `batch_size`, `warmup_ratio`, `weight_decay`,
+`max_grad_norm`, `gradient_checkpointing`, `seed`, the logging/eval/save
+strategies and intervals, `save_total_limit`, `early_stopping_patience` and
+`resume_from_checkpoint`.
+
+### On reproducing the paper
+
+**These defaults match the hyper-parameters the RepairLLaMA paper reports.
+That is not the same as reproducing the paper's results**, which also depend
+on the training corpus, the effective batch size, the hardware and details the
+paper does not report. Nothing here has been run against the paper's setup.
+Every run records what actually executed in `training_summary.json`, including
+a `reproduction` block that lists any hyper-parameter differing from the
+reported value and states plainly that reproduction is unverified.
+
+### What a run prints
+
+Before the first step:
+
+```
+Base model:            codellama/CodeLlama-7b-hf
+Device / dtype:        cuda:0 / bfloat16
+Base parameters:       6,738,415,616 (6.7B, frozen)
+Trainable parameters:  4,194,304 (4.2M)
+Trainable percentage:  0.0622%
+Dataset size:          train 48,213, validation 2,678
+Max sequence length:   1024 tokens
+Batch size:            4 x 8 accumulation = 32 effective
+Learning rate:         0.0005
+Epochs:                2
+LoRA configuration:    r=8, alpha=16, dropout=0.05, targets=['q_proj', 'v_proj']
+```
+
+### Guarantees
+
+- **Only the adapter learns.** The base is frozen at load time and again before
+  PEFT wraps it, the four LoRA assertions run before the first step, and a
+  `BaseWeightGuard` verifies after the last one that no base weight moved — a
+  run that somehow modified the base fails rather than saving.
+- **Only the adapter is saved.** `adapters/java-repair/` gets adapter weights,
+  the tokenizer (which matters, since `<FILL_ME>` was added to the vocabulary)
+  and `training_summary.json`. No optimizer state, no base checkpoint, nothing
+  merged.
+- **The prompt is not a target.** The collator masks prompt tokens with `-100`,
+  so the loss is computed on the replacement hunk only. Without that mask most
+  of the gradient signal would go into reproducing buggy Java.
+- **Resuming continues.** `--resume auto` takes the newest checkpoint;
+  a path that does not exist is an error rather than a silent fresh start.
+
+### Artifacts
+
+```
+outputs/training/<experiment>/checkpoint-<step>/   resumable, rotated, disposable
+adapters/java-repair/
+    adapter_model.safetensors    the deliverable
+    adapter_config.json
+    tokenizer.json, tokenizer_config.json
+    repairllama_adapter.json     language, base model, LoRA settings
+    training_summary.json        losses, settings, environment, reproduction
+```
+
+`training_summary.json` records the banner values, the loss curve, every
+evaluation with perplexity and token/sequence accuracy, the best validation
+loss, how many examples were truncated, the full settings, the library
+versions and the GPU.
+
 ## Configuration
 
 One file, [`configs/java_repair.yaml`](configs/java_repair.yaml), mirrors the
@@ -436,7 +529,7 @@ repairllama init                   # create data/, models/, outputs/ ...
 | `prepare-data` | clean, dedupe, represent, split, write JSONL | yes |
 | `model-check` | dry run: load, count parameters, verify device/dtype | yes |
 | `localize` | run fault localization | no |
-| `train` | fine-tune with LoRA | no |
+| `train` | fine-tune the LoRA adapter, save the artifact | yes |
 | `infer` | sample candidate patches | no |
 | `patch` | apply a candidate to a file | no |
 | `evaluate` | compile + test candidates, score | no |
@@ -464,6 +557,10 @@ python -m pytest tests/test_config.py  # one file
 - `tests/data/` — one file per pipeline module, over the corpora built by
   `java_pairs.py`: every transformation, every rejection reason, split
   determinism, and the JSONL/report output.
+- `tests/model/` and `tests/training/` — integration tests against a tiny Llama
+  built locally (`tiny_checkpoint.py`), including real short training runs that
+  check the base is unchanged, the artifact holds only the adapter, and
+  `--resume` continues rather than restarting.
 
 The remaining stage directories hold placeholder suites that assert the package
 imports and document the cases they will cover.
@@ -472,7 +569,6 @@ imports and document the cases they will cover.
 
 1. **Localization** — perfect localization from the reference diff, then
    stack-trace and spectrum strategies feeding the IR4 region.
-2. **Training** — the SFT loop over the JSONL splits, using the adapter this
-   layer builds (`repairllama.training`).
-3. **Inference + patching** — sampling, hunk application, syntax validation.
+2. **Inference** — sampling candidate patches from the trained adapter.
+3. **Patching** — hunk application and syntax validation.
 4. **Evaluation** — sandboxed maven/gradle runs, plausible/correct metrics.
