@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repairllama-java"
+version = "0.1.0"
+description = "Fine-tuned LLM program repair for Java (RepairLLaMA-style)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Agent-SWE" }]
+keywords = ["program-repair", "apr", "java", "llm", "lora"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+# Only what the package needs to import and run its config/CLI layer.
+# The training stack lives in the optional extras below and in
+# requirements.txt so that a bare checkout stays importable without torch.
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.3",
+    "transformers>=4.45",
+    "datasets>=2.20",
+    "peft>=0.12",
+    "trl>=0.9",
+    "accelerate>=0.33",
+]
+quant = ["bitsandbytes>=0.43; platform_system == 'Linux' or platform_system == 'Windows'"]
+java = ["tree-sitter==0.20.4", "tree-sitter-languages==1.10.2", "unidiff>=0.7"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
+
+[project.scripts]
+repairllama = "repairllama.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["repairllama*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

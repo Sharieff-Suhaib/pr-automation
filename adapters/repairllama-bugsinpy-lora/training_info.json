@@ -1,0 +1,27 @@
+{
+    "model": "codellama/CodeLlama-7b-hf",
+    "dataset": "/content/bugsinpy_ir4_or2.jsonl",
+    "valid_records": 1160,
+    "training_records": 1048,
+    "validation_records": 112,
+    "epochs": 2,
+    "max_seq_length": 1024,
+    "per_device_batch_size": 1,
+    "gradient_accumulation_steps": 16,
+    "effective_batch_size": 16,
+    "learning_rate": 0.0005,
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "target_modules": [
+        "q_proj",
+        "v_proj"
+    ],
+    "quantization": "4-bit NF4",
+    "double_quantization": true,
+    "compute_dtype": "torch.bfloat16",
+    "gpu": "Tesla T4",
+    "cuda": "12.8",
+    "pytorch": "2.11.0+cu128",
+    "bitsandbytes": "0.50.2"
+}
