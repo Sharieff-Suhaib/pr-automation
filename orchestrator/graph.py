@@ -9,10 +9,18 @@
     recommendation_agent  (Member 2)  -> similar bugs, strategy, tools, tests
       |
       v
+    environment_agent                 -> a cached venv with the repo's dependencies; cleanup
+      |
+      v
+    reproduction_agent                -> a test that fails on the unpatched code; the baseline run
+      |
+      v
     coding_agent          (Member 3)  -> unified diff patch
       |
       v
-    testing_agent         (Member 3)  -> apply the patch, run the suite
+    testing_agent                     -> run the suite before and after the patch, compare
+      |
+      +--> coding_agent   not solved yet, and attempts left: retry with the test feedback
       |
       v
     END
@@ -98,17 +106,102 @@ def recommendation_agent(state: AgentState) -> AgentState:
     )
 
 
+def environment_agent(state: AgentState) -> AgentState:
+    """Prepare the interpreter the repository's tests run with, and clean up old runs.
+
+    A repository that declares dependencies gets a cached virtual environment
+    with them; one that does not (or when building fails) uses this project's
+    interpreter, as before. Old workspaces and environments beyond the keep
+    limits are deleted first.
+    """
+    repo_path = state.get("repo_path", "")
+    if not repo_path:
+        return AgentState(trace=[trace_entry("environment_agent", "skipped: no repository")])
+
+    try:
+        env = adapters.prepare_test_environment(repo_path, enabled=state.get("isolated_env", True))
+    except AdapterError as error:
+        return AgentState(
+            errors=[f"environment_agent: {error}"],
+            trace=[trace_entry("environment_agent", "failed", error=str(error))],
+        )
+
+    removed = env.pop("removed")
+    summary = f"{env['status']}: {env['detail']}"
+    if removed:
+        summary += f" Removed {len(removed)} old director{'y' if len(removed) == 1 else 'ies'}."
+    update = AgentState(test_env=env, trace=[trace_entry("environment_agent", summary)])
+    if env["status"] == "failed":
+        update["errors"] = [f"environment_agent: {env['detail']}"]
+    return update
+
+
+def _python(state: AgentState) -> str | None:
+    """The interpreter chosen by environment_agent, if any."""
+    return (state.get("test_env") or {}).get("python")
+
+
+def reproduction_agent(state: AgentState) -> AgentState:
+    """Write a test that reproduces the issue, and run the baseline with it.
+
+    The test is kept only when it fails on the unpatched code, so it is real
+    evidence of the bug; the testing agent then reuses this node's baseline.
+    Disabled (`reproduce=False`) or without a repository, the node does nothing
+    and the testing agent runs a plain baseline itself.
+    """
+    repo_path = state.get("repo_path", "")
+    if not repo_path or not state.get("reproduce", True):
+        reason = "disabled" if repo_path else "no repository"
+        return AgentState(trace=[trace_entry("reproduction_agent", f"skipped: {reason}")])
+
+    backend = state.get("codegen_backend", "ollama")
+    if backend == "stub" and not state.get("stub_repro_path"):
+        return AgentState(trace=[trace_entry("reproduction_agent", "skipped: no stub test given")])
+
+    try:
+        reproduction, baseline = adapters.prepare_reproduction(
+            repo_path,
+            state.get("issue", ""),
+            state.get("relevant_code", []),
+            language=state.get("language", ""),
+            backend=backend,
+            stub_repro_path=state.get("stub_repro_path", ""),
+            python=_python(state),
+        )
+    except AdapterError as error:
+        return AgentState(
+            errors=[f"reproduction_agent: {error}"],
+            trace=[trace_entry("reproduction_agent", "failed", error=str(error))],
+        )
+
+    summary = f"{reproduction['status']} after {reproduction['attempts']} attempt(s)"
+    if reproduction["status"] == "accepted":
+        summary += f"; {len(reproduction['tests'])} test(s) fail on the unpatched code"
+    return AgentState(
+        reproduction=reproduction,
+        baseline_result=baseline,
+        trace=[trace_entry("reproduction_agent", summary, reason=reproduction["reason"])],
+    )
+
+
 def coding_agent(state: AgentState) -> AgentState:
-    """Member 3: turn the issue plus the recommendations into a unified diff."""
+    """Member 3: turn the issue plus the recommendations into a unified diff.
+
+    On a retry, `test_feedback` (why the previous patch was rejected) is part of
+    the prompt; the original code is repaired again from scratch.
+    """
     relevant_code = state.get("relevant_code", [])
+    attempt = state.get("attempt", 0) + 1
     if not relevant_code:
         return AgentState(
             patch="",
             patch_source="none",
+            patch_error="No relevant code to repair.",
             errors=["coding_agent: no relevant code to repair."],
             trace=[trace_entry("coding_agent", "skipped: no relevant code")],
         )
 
+    feedback = state.get("test_feedback", "")
     try:
         patch, source = adapters.generate_patch(
             issue=state.get("issue", ""),
@@ -119,22 +212,29 @@ def coding_agent(state: AgentState) -> AgentState:
             tests=state.get("tests", []),
             backend=state.get("codegen_backend", "ollama"),
             stub_patch_path=state.get("stub_patch_path", ""),
+            repo_path=state.get("repo_path", ""),
+            relevant_chunks=relevant_code,
+            feedback=feedback,
+            attempt=attempt,
         )
     except AdapterError as error:
         return AgentState(
             patch="",
             patch_source="none",
-            errors=[f"coding_agent: {error}"],
-            trace=[trace_entry("coding_agent", "failed", error=str(error))],
+            patch_error=str(error),
+            errors=[f"coding_agent (attempt {attempt}): {error}"],
+            trace=[trace_entry("coding_agent", f"attempt {attempt} failed", error=str(error))],
         )
 
+    retry_note = " using the previous attempt's feedback" if feedback else ""
     return AgentState(
         patch=patch,
         patch_source=source,
+        patch_error="",
         trace=[
             trace_entry(
                 "coding_agent",
-                f"{len(patch.splitlines())}-line patch via {source}",
+                f"attempt {attempt}: {len(patch.splitlines())}-line patch via {source}{retry_note}",
                 source=source,
             )
         ],
@@ -142,10 +242,18 @@ def coding_agent(state: AgentState) -> AgentState:
 
 
 def testing_agent(state: AgentState) -> AgentState:
-    """Member 3: apply the patch to a throwaway copy and run the test suite.
+    """Run the suite before and after the patch and judge the difference.
 
-    With no patch to apply, the suite is still run on the unmodified repository
-    so the report carries a real baseline instead of an empty placeholder.
+    `status` comes from the before/after verdict, not from the patched run alone:
+    "solved" needs at least one test to go from failing to passing with none
+    breaking. The baseline is taken from the state when a previous pass already
+    ran it, so retries against the same repository do not pay for it twice.
+    With no patch, the baseline still runs so the report carries real numbers.
+
+    Every pass is one attempt of the retry loop: it is recorded in `attempts`,
+    compared with `best_attempt`, and -- unless solved -- explained in
+    `test_feedback` for the coding agent. When the loop ends without a solved
+    attempt, the best attempt is what the report shows.
     """
     repo_path = state.get("repo_path", "")
     patch = state.get("patch", "")
@@ -155,84 +263,187 @@ def testing_agent(state: AgentState) -> AgentState:
         return AgentState(
             patch_status="SKIPPED",
             test_result=_skipped("No repository was available to test."),
+            test_verdict=_not_tested("No repository was available to test."),
             status="failed",
             trace=[trace_entry("testing_agent", "skipped: no repository")],
         )
 
-    if not patch.strip():
-        try:
-            baseline = adapters.run_baseline_tests(repo_path, language=language)
-        except AdapterError as error:
-            return AgentState(
-                patch_status="SKIPPED",
-                test_result=_skipped(str(error)),
-                status="failed",
-                errors=[f"testing_agent: {error}"],
-                trace=[trace_entry("testing_agent", "failed", error=str(error))],
-            )
-
-        baseline["baseline"] = True
-        return AgentState(
-            patch_status="SKIPPED",
-            test_result=baseline,
-            status="failed",
-            trace=[
-                trace_entry(
-                    "testing_agent",
-                    f"no patch to apply; baseline suite {baseline['status']}",
-                )
-            ],
-        )
-
+    outcome: dict = {"working_repo": "", "changed_files": [], "errors": []}
     try:
-        result = adapters.apply_and_test(repo_path, patch, language=language)
+        baseline = state.get("baseline_result") or adapters.run_baseline_tests(
+            repo_path, language=language, python=_python(state)
+        )
+        if not patch.strip():
+            reason = state.get("patch_error") or "No patch was generated."
+            outcome.update(
+                patch_status="SKIPPED",
+                test_result=_skipped("No patch was generated."),
+                test_verdict=_not_tested(f"No patch was generated: {reason}"),
+                summary=f"no patch to apply; baseline {_counts(baseline)}",
+            )
+        else:
+            result = adapters.apply_and_test(
+                repo_path,
+                patch,
+                language=language,
+                baseline=baseline,
+                reproduction=state.get("reproduction"),
+                python=_python(state),
+            )
+            verdict = result["test_verdict"]
+            outcome.update(
+                working_repo=result["working_repo"],
+                changed_files=result["changed_files"],
+                patch_status=result["patch_status"],
+                test_result=result["test_result"],
+                test_verdict=verdict,
+                summary=(
+                    f"patch {result['patch_status']}; baseline {_counts(baseline)}, "
+                    f"patched {_counts(result['test_result'])}; {len(verdict['fail_to_pass'])} fixed, "
+                    f"{len(verdict['pass_to_fail'])} broken -> {verdict['status']}"
+                ),
+            )
     except AdapterError as error:
-        return AgentState(
+        baseline = state.get("baseline_result") or {}
+        outcome.update(
             patch_status="SKIPPED",
             test_result=_skipped(str(error)),
-            status="failed",
+            test_verdict=_not_tested(str(error)),
+            summary="failed",
             errors=[f"testing_agent: {error}"],
-            trace=[trace_entry("testing_agent", "failed", error=str(error))],
         )
 
-    test_result = result["test_result"]
-    solved = result["patch_status"] == "APPLIED" and test_result["status"] == "PASS"
+    return _record_attempt(state, outcome, baseline)
 
-    return AgentState(
-        working_repo=result["working_repo"],
-        changed_files=result["changed_files"],
-        patch_status=result["patch_status"],
-        test_result=test_result,
-        status="solved" if solved else "failed",
+
+def _record_attempt(state: AgentState, outcome: dict, baseline: dict) -> AgentState:
+    """Bookkeeping shared by every testing pass: history, best attempt, feedback."""
+    number = state.get("attempt", 0) + 1
+    current = {
+        "attempt": number,
+        "patch": state.get("patch", ""),
+        "patch_source": state.get("patch_source", "none"),
+        "patch_error": state.get("patch_error", ""),
+        "working_repo": outcome["working_repo"],
+        "changed_files": outcome["changed_files"],
+        "patch_status": outcome["patch_status"],
+        "test_result": outcome["test_result"],
+        "test_verdict": outcome["test_verdict"],
+        "status": outcome["test_verdict"]["status"],
+    }
+
+    best = state.get("best_attempt")
+    if adapters.is_better_attempt(current, best):
+        best = current
+
+    finished = current["status"] == "solved" or not _can_retry(state, number)
+    shown = best if finished else current
+    earlier_patches = [row.get("patch", "") for row in state.get("attempts", [])]
+    feedback = "" if current["status"] == "solved" else adapters.attempt_feedback(current, earlier_patches)
+    verdict = current["test_verdict"]
+
+    update = AgentState(
+        attempt=number,
+        best_attempt=best,
+        test_feedback=feedback,
+        baseline_result=baseline,
+        # The report and the routing read these, so they hold the best attempt once
+        # the loop is over and the current one while it is still going.
+        patch=shown["patch"],
+        patch_source=shown["patch_source"],
+        working_repo=shown["working_repo"],
+        changed_files=shown["changed_files"],
+        patch_status=shown["patch_status"],
+        test_result=shown["test_result"],
+        test_verdict=shown["test_verdict"],
+        status=shown["status"] if finished else "running",
+        attempts=[
+            {
+                "attempt": number,
+                "patch": current["patch"],
+                "patch_source": current["patch_source"],
+                "patch_status": current["patch_status"],
+                "status": current["status"],
+                "reason": verdict["reason"],
+                "fixed": len(verdict["fail_to_pass"]),
+                "broken": len(verdict["pass_to_fail"]),
+            }
+        ],
         trace=[
             trace_entry(
                 "testing_agent",
-                f"patch {result['patch_status']}, tests {test_result['status']} "
-                f"({test_result['passed']} passed, {test_result['failed']} failed)",
-                working_repo=result["working_repo"],
+                f"attempt {number}: {outcome['summary']}",
+                working_repo=current["working_repo"],
+                reason=verdict["reason"],
             )
         ],
     )
+    if outcome["errors"]:
+        update["errors"] = outcome["errors"]
+    if finished and shown is not current:
+        update["trace"].append(
+            trace_entry("testing_agent", f"no attempt solved the issue; reporting attempt {shown['attempt']}")
+        )
+    return update
+
+
+def _can_retry(state: AgentState, attempts_made: int) -> bool:
+    """Whether another coding pass could change anything."""
+    if attempts_made >= state.get("max_attempts", 3):
+        return False
+    # Replaying the same fixture diff cannot produce a different patch.
+    if state.get("codegen_backend", "ollama") == "stub":
+        return False
+    return bool(state.get("relevant_code"))
+
+
+def route_after_testing(state: AgentState) -> str:
+    """Loop back to the coding agent while an attempt is still running."""
+    return "coding_agent" if state.get("status") == "running" else END
+
+
+def _counts(result: dict) -> str:
+    return f"{result['status']} ({result['passed']} passed, {result['failed']} failed)"
 
 
 def _skipped(reason: str) -> dict:
-    return {"status": "SKIPPED", "passed": 0, "failed": 0, "errors": [reason], "output": ""}
+    return {"status": "SKIPPED", "passed": 0, "failed": 0, "errors": [reason], "output": "", "cases": {}}
+
+
+def _not_tested(reason: str) -> dict:
+    """Same shape as `TestVerdict.to_dict()`, without importing the testing agent here."""
+    return {
+        "status": "failed",
+        "reason": reason,
+        "fail_to_pass": [],
+        "pass_to_pass": [],
+        "pass_to_fail": [],
+        "fail_to_fail": [],
+        "added": {},
+        "reproduction": {},
+        "stage": "none",
+        "per_test": False,
+    }
 
 
 def build_graph():
-    """Wire the four agents into a compiled LangGraph workflow."""
+    """Wire the six agents into a compiled LangGraph workflow."""
     builder = StateGraph(AgentState)
 
     builder.add_node("repository_agent", repository_agent)
     builder.add_node("recommendation_agent", recommendation_agent)
+    builder.add_node("environment_agent", environment_agent)
+    builder.add_node("reproduction_agent", reproduction_agent)
     builder.add_node("coding_agent", coding_agent)
     builder.add_node("testing_agent", testing_agent)
 
     builder.add_edge(START, "repository_agent")
     builder.add_edge("repository_agent", "recommendation_agent")
-    builder.add_edge("recommendation_agent", "coding_agent")
+    builder.add_edge("recommendation_agent", "environment_agent")
+    builder.add_edge("environment_agent", "reproduction_agent")
+    builder.add_edge("reproduction_agent", "coding_agent")
     builder.add_edge("coding_agent", "testing_agent")
-    builder.add_edge("testing_agent", END)
+    builder.add_conditional_edges("testing_agent", route_after_testing, ["coding_agent", END])
 
     return builder.compile()
 

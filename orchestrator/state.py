@@ -38,21 +38,46 @@ class AgentState(TypedDict, total=False):
     tools: list[str]
     tests: list[str]
 
+    # --- Test environment ---
+    # The interpreter every test run uses: a cached venv with the repository's
+    # dependencies, or this project's interpreter (see environment.py).
+    test_env: dict[str, Any]
+
+    # --- Reproduction Agent ---
+    # A test written to reproduce the issue, kept only if it fails on the
+    # unpatched code (see src/agents/testing_agent/reproduction.py). Its run is
+    # also the baseline, so this node fills `baseline_result` too.
+    reproduction: dict[str, Any]
+
     # --- Coding Agent (Member 3) ---
     patch: str
-    patch_source: str  # "ollama" | "stub" | "none"
+    patch_source: str  # "ollama-function" | "ollama" (model wrote the diff) | "stub" | "none"
 
-    # --- Testing Agent (Member 3) ---
+    # --- Testing Agent ---
     working_repo: str
     changed_files: list[str]
     patch_status: str  # "APPLIED" | "PATCH_APPLY_FAILED" | "SKIPPED" | ...
-    test_result: dict[str, Any]
+    baseline_result: dict[str, Any]  # the suite on the unpatched repo; run once, then reused
+    test_result: dict[str, Any]  # the suite on the patched copy
+    test_verdict: dict[str, Any]  # TestVerdict.to_dict(): before/after comparison
+
+    # --- Retry loop ---
+    # testing_agent -> coding_agent until solved or `max_attempts` patches tried.
+    attempt: int  # patches tested so far
+    patch_error: str  # why the latest coding_agent pass produced no patch ("" if it did)
+    test_feedback: str  # why the latest attempt was rejected; read by coding_agent
+    best_attempt: dict[str, Any]  # the best attempt so far; reported if none is solved
+    attempts: Annotated[list[dict[str, Any]], operator.add]  # one summary per attempt
 
     # --- Control / configuration ---
     top_k: int
     codegen_backend: str  # "ollama" (default) | "stub"
     stub_patch_path: str  # fixture diff, only read when codegen_backend == "stub"
-    status: str  # "running" | "solved" | "failed"
+    max_attempts: int  # patches to try before giving up (default 3; stub backend: 1)
+    reproduce: bool  # write a reproduction test before the patch (default True)
+    isolated_env: bool  # build a venv with the repository's dependencies (default True)
+    stub_repro_path: str  # fixture test, only read when codegen_backend == "stub"
+    status: str  # "running" | "solved" | "unverified" | "failed"
 
     # --- Bookkeeping. `operator.add` so each node appends instead of clobbering. ---
     trace: Annotated[list[dict[str, Any]], operator.add]
@@ -65,6 +90,10 @@ def new_state(
     top_k: int = 5,
     codegen_backend: str = "ollama",
     stub_patch_path: str = "",
+    reproduce: bool = True,
+    stub_repro_path: str = "",
+    max_attempts: int = 3,
+    isolated_env: bool = True,
 ) -> AgentState:
     """Build the initial state for one repair run."""
     return AgentState(
@@ -73,6 +102,12 @@ def new_state(
         top_k=top_k,
         codegen_backend=codegen_backend,
         stub_patch_path=stub_patch_path,
+        reproduce=reproduce,
+        stub_repro_path=stub_repro_path,
+        max_attempts=max_attempts,
+        isolated_env=isolated_env,
+        attempt=0,
+        attempts=[],
         status="running",
         trace=[],
         errors=[],

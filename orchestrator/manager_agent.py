@@ -20,10 +20,23 @@ from orchestrator.state import AgentState, new_state
 class ManagerAgent:
     """Starts one repair run per issue and reports the result."""
 
-    def __init__(self, top_k: int = 5, codegen_backend: str = "ollama", stub_patch_path: str = ""):
+    def __init__(
+        self,
+        top_k: int = 5,
+        codegen_backend: str = "ollama",
+        stub_patch_path: str = "",
+        reproduce: bool = True,
+        stub_repro_path: str = "",
+        max_attempts: int = 3,
+        isolated_env: bool = True,
+    ):
         self.top_k = top_k
         self.codegen_backend = codegen_backend
         self.stub_patch_path = stub_patch_path
+        self.reproduce = reproduce
+        self.stub_repro_path = stub_repro_path
+        self.max_attempts = max_attempts
+        self.isolated_env = isolated_env
         self.graph = get_graph()
 
     def solve(self, repo_url: str, issue: str) -> dict[str, Any]:
@@ -34,6 +47,10 @@ class ManagerAgent:
             top_k=self.top_k,
             codegen_backend=self.codegen_backend,
             stub_patch_path=self.stub_patch_path,
+            reproduce=self.reproduce,
+            stub_repro_path=self.stub_repro_path,
+            max_attempts=self.max_attempts,
+            isolated_env=self.isolated_env,
         )
         final: AgentState = self.graph.invoke(initial)
         return build_report(final)
@@ -67,15 +84,24 @@ def build_report(state: AgentState) -> dict[str, Any]:
         "strategy": state.get("strategy", ""),
         "tools": state.get("tools", []),
         "tests": state.get("tests", []),
+        "test_env": state.get("test_env") or {},
+        "reproduction": state.get("reproduction") or {},
         "patch": state.get("patch", ""),
         "patch_source": state.get("patch_source", "none"),
         "patch_status": state.get("patch_status", "SKIPPED"),
         "changed_files": state.get("changed_files", []),
         "working_repo": state.get("working_repo", ""),
-        # `test_status` is the plain PASS/FAIL/SKIPPED string; `test_result` keeps
-        # the counts and runner output behind it.
+        # `test_status` is the plain PASS/FAIL/SKIPPED string of the patched run;
+        # `test_result` keeps the counts and runner output behind it.
         "test_status": test_result.get("status", "SKIPPED"),
         "test_result": test_result,
+        # The same suite on the unpatched repository, and the before/after
+        # comparison that `status` is decided from.
+        "baseline_result": state.get("baseline_result") or {},
+        "test_verdict": state.get("test_verdict") or {},
+        # One row per patch the retry loop tested; the fields above show the
+        # solved attempt, or the best one when none was solved.
+        "attempts": state.get("attempts", []),
         "errors": state.get("errors", []),
         "trace": state.get("trace", []),
     }
@@ -87,12 +113,20 @@ def solve_issue(
     top_k: int = 5,
     codegen_backend: str = "ollama",
     stub_patch_path: str = "",
+    reproduce: bool = True,
+    stub_repro_path: str = "",
+    max_attempts: int = 3,
+    isolated_env: bool = True,
 ) -> dict[str, Any]:
     """One-call convenience wrapper around `ManagerAgent.solve`."""
     manager = ManagerAgent(
         top_k=top_k,
         codegen_backend=codegen_backend,
         stub_patch_path=stub_patch_path,
+        reproduce=reproduce,
+        stub_repro_path=stub_repro_path,
+        max_attempts=max_attempts,
+        isolated_env=isolated_env,
     )
     return manager.solve(repo_url, issue)
 
@@ -109,6 +143,14 @@ def _parse_args() -> argparse.Namespace:
         help="'stub' replays a fixture diff instead of calling the model",
     )
     parser.add_argument("--stub-patch", default="", help="Fixture diff used when --codegen-backend stub")
+    parser.add_argument("--stub-repro", default="", help="Fixture test used when --codegen-backend stub")
+    parser.add_argument(
+        "--no-repro-test", action="store_true", help="Skip writing a test that reproduces the issue"
+    )
+    parser.add_argument("--max-attempts", type=int, default=3, help="Patches to try (default: 3)")
+    parser.add_argument(
+        "--no-isolated-env", action="store_true", help="Run tests with this interpreter, not a per-repo venv"
+    )
     return parser.parse_args()
 
 
@@ -120,6 +162,10 @@ def main() -> int:
         top_k=args.top_k,
         codegen_backend=args.codegen_backend,
         stub_patch_path=args.stub_patch,
+        reproduce=not args.no_repro_test,
+        stub_repro_path=args.stub_repro,
+        max_attempts=args.max_attempts,
+        isolated_env=not args.no_isolated_env,
     )
     print(json.dumps(report, indent=2))
     return 0 if report["status"] == "solved" else 1

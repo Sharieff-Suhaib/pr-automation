@@ -18,6 +18,9 @@ from typing import Any
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("AGENT_SWE_CODEGEN_MODEL", "codellama:7b")
 REQUEST_TIMEOUT_SECONDS = 300
+# A minimal repair is a few hundred tokens. Without a cap, a small model that
+# starts repeating hunks keeps going until the request times out.
+MAX_PATCH_TOKENS = int(os.environ.get("AGENT_SWE_CODEGEN_MAX_TOKENS", "1024"))
 
 SYSTEM_PROMPT = """You are a software repair agent.
 Return only a standard unified diff patch. Do not include explanations or Markdown."""
@@ -99,15 +102,20 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _call_ollama(prompt: str, model: str = DEFAULT_MODEL) -> str:
+def _call_ollama(
+    prompt: str,
+    model: str = DEFAULT_MODEL,
+    system: str = SYSTEM_PROMPT,
+    temperature: float = 0,
+) -> str:
     """Send one non-streaming request to the local Ollama server."""
     payload = json.dumps(
         {
             "model": model,
             "prompt": prompt,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "stream": False,
-            "options": {"temperature": 0},
+            "options": {"temperature": temperature, "num_predict": MAX_PATCH_TOKENS},
         }
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -125,10 +133,21 @@ def _call_ollama(prompt: str, model: str = DEFAULT_MODEL) -> str:
         raise PatchGenerationError(
             f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and pull {model}."
         ) from exc
+    except TimeoutError as exc:
+        # A read timeout is raised as a bare socket timeout, not a URLError.
+        raise PatchGenerationError(
+            f"Ollama did not answer within {REQUEST_TIMEOUT_SECONDS} seconds."
+        ) from exc
 
     patch = body.get("response", "")
     if not patch.strip():
         raise PatchGenerationError("The LLM returned an empty patch.")
+    if body.get("done_reason") == "length":
+        # A diff cut off mid-hunk cannot apply, so report why instead of passing it on.
+        raise PatchGenerationError(
+            f"The LLM's patch was cut off at {MAX_PATCH_TOKENS} tokens; "
+            "it was probably repeating itself."
+        )
     return patch
 
 
