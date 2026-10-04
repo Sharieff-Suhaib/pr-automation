@@ -20,10 +20,14 @@
       v
     testing_agent                     -> run the suite before and after the patch, compare
       |
-      +--> coding_agent   not solved yet, and attempts left: retry with the test feedback
-      |
+      +--> reflection_agent  not solved: analyse why (LLM, rule-based fallback)
+      |        |
+      |        +--> coding_agent  attempts left: retry with the reflection + test feedback
+      |        |
+      |        v
+      |       END                 max_attempts reached
       v
-    END
+    END                           solved
 
 Each node is a function `AgentState -> partial AgentState`. Nodes never raise:
 a failing agent records its message in `errors` and returns empty results, so a
@@ -344,6 +348,7 @@ def _record_attempt(state: AgentState, outcome: dict, baseline: dict) -> AgentSt
 
     update = AgentState(
         attempt=number,
+        last_attempt=current,
         best_attempt=best,
         test_feedback=feedback,
         baseline_result=baseline,
@@ -397,8 +402,63 @@ def _can_retry(state: AgentState, attempts_made: int) -> bool:
     return bool(state.get("relevant_code"))
 
 
+def reflection_agent(state: AgentState) -> AgentState:
+    """Analyse the attempt that just failed; its guidance leads the coding agent's next prompt.
+
+    Runs after every failed attempt, including the last: then the status is
+    `max_retries` and the analysis explains the final failure in the report.
+    It never edits code. With the `stub` backend the analysis is rule-based,
+    so offline runs need no model.
+    """
+    attempt = state.get("last_attempt") or {}
+    try:
+        reflection = adapters.reflect(
+            issue=state.get("issue", ""),
+            relevant_code=adapters.format_relevant_code(state.get("relevant_code", [])),
+            attempt=attempt,
+            strategy=state.get("strategy", ""),
+            previous_attempts=state.get("attempts", []),
+            max_attempts=state.get("max_attempts", 3),
+            use_llm=state.get("codegen_backend", "ollama") != "stub",
+        )
+    except AdapterError as error:
+        # Without a reflection the retry still has the testing agent's feedback.
+        return AgentState(
+            errors=[f"reflection_agent: {error}"],
+            trace=[trace_entry("reflection_agent", "failed", error=str(error))],
+        )
+
+    if state.get("status") != "running":
+        # The testing agent already ended the loop; keep its decision.
+        reflection["status"] = "max_retries" if reflection["status"] == "retry" else reflection["status"]
+    feedback = reflection.pop("feedback")
+    update = AgentState(
+        reflection=reflection,
+        reflections=[reflection],
+        trace=[
+            trace_entry(
+                "reflection_agent",
+                f"attempt {attempt.get('attempt')}: {reflection['failure_type']} -> {reflection['status']} "
+                f"({len(reflection['failed_tests'])} failed test(s), {reflection['source']} analysis)",
+                root_cause=reflection["root_cause"],
+            )
+        ],
+    )
+    if state.get("status") == "running":
+        update["test_feedback"] = f"{feedback}\n\n{state.get('test_feedback', '')}".strip()
+    return update
+
+
 def route_after_testing(state: AgentState) -> str:
-    """Loop back to the coding agent while an attempt is still running."""
+    """Solved (or nothing was tested) ends the run; any failed attempt goes to reflection."""
+    attempt = state.get("last_attempt")
+    if not attempt or attempt.get("status") == "solved":
+        return END
+    return "reflection_agent"
+
+
+def route_after_reflection(state: AgentState) -> str:
+    """Retry while the testing agent left attempts open; otherwise stop (no unbounded loop)."""
     return "coding_agent" if state.get("status") == "running" else END
 
 
@@ -427,7 +487,7 @@ def _not_tested(reason: str) -> dict:
 
 
 def build_graph():
-    """Wire the six agents into a compiled LangGraph workflow."""
+    """Wire the seven agents into a compiled LangGraph workflow."""
     builder = StateGraph(AgentState)
 
     builder.add_node("repository_agent", repository_agent)
@@ -436,6 +496,7 @@ def build_graph():
     builder.add_node("reproduction_agent", reproduction_agent)
     builder.add_node("coding_agent", coding_agent)
     builder.add_node("testing_agent", testing_agent)
+    builder.add_node("reflection_agent", reflection_agent)
 
     builder.add_edge(START, "repository_agent")
     builder.add_edge("repository_agent", "recommendation_agent")
@@ -443,7 +504,8 @@ def build_graph():
     builder.add_edge("environment_agent", "reproduction_agent")
     builder.add_edge("reproduction_agent", "coding_agent")
     builder.add_edge("coding_agent", "testing_agent")
-    builder.add_conditional_edges("testing_agent", route_after_testing, ["coding_agent", END])
+    builder.add_conditional_edges("testing_agent", route_after_testing, ["reflection_agent", END])
+    builder.add_conditional_edges("reflection_agent", route_after_reflection, ["coding_agent", END])
 
     return builder.compile()
 

@@ -279,10 +279,35 @@ so the tests it skipped never count as broken. `test_result.stages` and
 `test_verdict.stage` record how far a patch got. Non-pytest projects go straight
 from `syntax` to `full`.
 
+## The Reflection Agent
+
+`src/agents/reflection_agent/` runs after every failed attempt (never after a
+solved one) and never edits code. It reads the issue, the faulty code, the
+failed patch, the before/after test comparison with failure messages, the
+strategy and earlier attempts, and returns:
+
+```json
+{"status": "retry", "failure_type": "runtime_error", "root_cause": "...",
+ "patch_analysis": "...", "failed_tests": ["..."], "suggested_changes": ["..."],
+ "repair_guidance": "...", "confidence": 0.8, "attempt": 1, "source": "llm"}
+```
+
+`failure_type` (syntax_error, compilation_error, test_failure, runtime_error,
+logic_error, regression, patch_application_error, unknown) is classified from
+the test results. The analysis comes from the coding agent's Ollama model; if
+it is unreachable or returns unusable JSON, a rule-based analysis is used
+(`source: "rules"`; always with the `stub` backend). Its feedback -- starting
+"This is a repair retry. The previous patch failed validation..." -- leads the
+coding agent's next prompt, followed by the testing agent's per-test feedback.
+After the last attempt it still runs once with `status: max_retries`, so the
+report explains the final failure, and then the run ends. Progress is logged as
+`[ReflectionAgent] ...` lines.
+
 ## The retry loop
 
-When an attempt is not `solved`, `testing_agent` routes back to `coding_agent`
-(up to `max_attempts`, default 3; the `stub` backend never retries since it
+When an attempt is not `solved`, `testing_agent` routes to `reflection_agent`
+and then back to `coding_agent` (up to `max_attempts`, default 3, or
+`AGENT_SWE_MAX_REPAIR_ATTEMPTS`; the `stub` backend never retries since it
 replays the same fixture). The coding agent gets `test_feedback`: the verdict,
 the reproduction tests that still fail, the tests the patch broke, their
 failure messages, and the rejected patch -- flagged when it repeats an earlier

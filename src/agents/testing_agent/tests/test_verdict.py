@@ -99,7 +99,19 @@ def test_a_still_failing_reproduction_test_blocks_solved():
 
     assert verdict.status == "unverified"
     assert verdict.reproduction == {"repro::r": "failed"}
-    assert "reproduction test still fails" in verdict.reason
+    assert "1 of the issue's 1 reproduction test(s) still fail" in verdict.reason
+
+
+def test_a_half_fixed_reproduction_is_not_solved():
+    # Seen in a real run: the patch fixed get_user but login still crashed.
+    verdict = compare_runs(
+        run({"repro::get_user": "failed", "repro::login": "failed"}, "FAIL"),
+        run({"repro::get_user": "passed", "repro::login": "failed"}, "FAIL"),
+        reproduction_tests=["repro::get_user", "repro::login"],
+    )
+
+    assert verdict.status == "unverified"
+    assert "1 of the issue's 2 reproduction test(s) still fail" in verdict.reason
 
 
 def test_not_tested_is_a_failed_verdict():

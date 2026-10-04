@@ -17,8 +17,8 @@ The verdict:
     failed      something broke, or the patch could not be tested
 
 When a reproduction test for the issue took part (see `reproduction.py`), it is
-the most direct evidence there is, so "solved" also requires at least one of
-its tests to pass after the patch.
+the most direct evidence there is, so "solved" also requires every one of its
+tests to pass after the patch -- a patch that fixes half the issue is not done.
 """
 
 from __future__ import annotations
@@ -86,7 +86,8 @@ def compare_runs(
 
     verdict = TestVerdict(status=NOT_SOLVED, reason="")
     verdict.reproduction = {test_id: after.get(test_id, MISSING) for test_id in reproduction_tests or []}
-    reproduced_fix = any(outcome == PASSED for outcome in verdict.reproduction.values())
+    still_failing = [t for t, outcome in verdict.reproduction.items() if outcome != PASSED]
+    reproduced_fix = bool(verdict.reproduction) and not still_failing
     for test_id, outcome_before in before.items():
         outcome_after = after.get(test_id, MISSING)
         # A skip says nothing about the bug either way.
@@ -118,8 +119,8 @@ def compare_runs(
     elif verdict.fail_to_pass and verdict.reproduction and not reproduced_fix:
         verdict.status = UNVERIFIED
         verdict.reason = (
-            f"Nothing broke and {len(verdict.fail_to_pass)} test(s) now pass, "
-            "but the issue's reproduction test still fails."
+            f"Nothing broke and {len(verdict.fail_to_pass)} test(s) now pass, but "
+            f"{len(still_failing)} of the issue's {len(verdict.reproduction)} reproduction test(s) still fail."
         )
     elif verdict.fail_to_pass:
         verdict.status = SOLVED

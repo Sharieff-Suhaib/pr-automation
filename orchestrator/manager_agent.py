@@ -14,7 +14,7 @@ import json
 from typing import Any
 
 from orchestrator.graph import get_graph
-from orchestrator.state import AgentState, new_state
+from orchestrator.state import DEFAULT_MAX_ATTEMPTS, AgentState, new_state
 
 
 class ManagerAgent:
@@ -27,7 +27,7 @@ class ManagerAgent:
         stub_patch_path: str = "",
         reproduce: bool = True,
         stub_repro_path: str = "",
-        max_attempts: int = 3,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         isolated_env: bool = True,
     ):
         self.top_k = top_k
@@ -102,6 +102,9 @@ def build_report(state: AgentState) -> dict[str, Any]:
         # One row per patch the retry loop tested; the fields above show the
         # solved attempt, or the best one when none was solved.
         "attempts": state.get("attempts", []),
+        # The Reflection Agent's analysis of the last failed attempt, and of every one.
+        "reflection": state.get("reflection") or {},
+        "reflections": state.get("reflections", []),
         "errors": state.get("errors", []),
         "trace": state.get("trace", []),
     }
@@ -115,7 +118,7 @@ def solve_issue(
     stub_patch_path: str = "",
     reproduce: bool = True,
     stub_repro_path: str = "",
-    max_attempts: int = 3,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     isolated_env: bool = True,
 ) -> dict[str, Any]:
     """One-call convenience wrapper around `ManagerAgent.solve`."""
@@ -147,7 +150,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-repro-test", action="store_true", help="Skip writing a test that reproduces the issue"
     )
-    parser.add_argument("--max-attempts", type=int, default=3, help="Patches to try (default: 3)")
+    parser.add_argument(
+        "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+        help=f"Patches to try (default: {DEFAULT_MAX_ATTEMPTS}, env AGENT_SWE_MAX_REPAIR_ATTEMPTS)",
+    )
     parser.add_argument(
         "--no-isolated-env", action="store_true", help="Run tests with this interpreter, not a per-repo venv"
     )

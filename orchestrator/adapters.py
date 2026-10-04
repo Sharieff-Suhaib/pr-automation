@@ -421,6 +421,41 @@ def attempt_feedback(attempt: dict[str, Any], earlier_patches: list[str] | None 
     )
 
 
+# The Reflection Agent's model: None uses the coding agent's Ollama model. Tests
+# replace it with a fake callable (prompt -> reply).
+REFLECTION_LLM = None
+
+
+def reflect(
+    issue: str,
+    relevant_code: str,
+    attempt: dict[str, Any],
+    strategy: str = "",
+    previous_attempts: list[dict[str, Any]] | None = None,
+    max_attempts: int = 3,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    """Run the Reflection Agent on one tested attempt; returns `ReflectionResult.to_dict()`
+    plus `feedback`, the text the coding agent receives next."""
+    _ensure_import_paths()
+    try:
+        from src.agents.reflection_agent import ReflectionAgent  # noqa: PLC0415
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise AdapterError(f"Reflection agent is unavailable: {error}") from error
+
+    result = ReflectionAgent(llm=REFLECTION_LLM, use_llm=use_llm).reflect(
+        issue=issue,
+        relevant_code=relevant_code,
+        generated_patch=attempt.get("patch", ""),
+        test_results=attempt,
+        repair_strategy=strategy,
+        previous_attempts=previous_attempts,
+        attempt=attempt.get("attempt", 1),
+        max_attempts=max_attempts,
+    )
+    return {**result.to_dict(), "feedback": result.as_feedback()}
+
+
 def is_better_attempt(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
     """Whether `candidate` should replace `current` as the attempt to report."""
     _ensure_import_paths()

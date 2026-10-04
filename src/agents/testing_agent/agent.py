@@ -209,7 +209,7 @@ def run_stages(
         result = run_suite(repository, python=python, language=language, paths=reproduction_files)
         stages.append(_stage("reproduction", result))
         verdict = compare_runs(_scoped(baseline, reproduction_files), result, reproduction_tests)
-        if not any(outcome == PASSED for outcome in verdict.reproduction.values()):
+        if not all(outcome == PASSED for outcome in verdict.reproduction.values()):
             verdict.reason = (
                 "The issue's reproduction test still fails, so the rest of the suite was not run. "
                 + verdict.reason

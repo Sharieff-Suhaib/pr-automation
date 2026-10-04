@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from orchestrator.manager_agent import solve_issue
+from orchestrator.state import DEFAULT_MAX_ATTEMPTS
 
 ORCHESTRATOR_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = ORCHESTRATOR_DIR / "outputs"
@@ -48,7 +50,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-repro-test", action="store_true", help="Skip writing a test that reproduces the issue"
     )
-    parser.add_argument("--max-attempts", type=int, default=3, help="Patches to try (default: 3)")
+    parser.add_argument(
+        "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+        help=f"Patches to try (default: {DEFAULT_MAX_ATTEMPTS}, env AGENT_SWE_MAX_REPAIR_ATTEMPTS)",
+    )
     parser.add_argument(
         "--no-isolated-env", action="store_true", help="Run tests with this interpreter, not a per-repo venv"
     )
@@ -57,6 +62,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    # Shows the agents' progress lines, e.g. "[ReflectionAgent] Failure type: logic_error".
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    for noisy in ("httpx", "sentence_transformers", "urllib3", "filelock", "huggingface_hub"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.offline:
         repo_url = args.repo_url or str(SAMPLE_REPO)
@@ -168,6 +177,20 @@ def format_report(report: dict[str, Any]) -> str:
                 f"{row['attempt']}. {row['status'].upper():<10} patch {row['patch_status']} via "
                 f"{row['patch_source']}: {row['fixed']} fixed, {row['broken']} broken - {row['reason']}"
             )
+
+    for reflection in report.get("reflections", []):
+        lines += ["", "=" * 70, f"REFLECTION ON ATTEMPT {reflection['attempt']} ({reflection['source']})", "=" * 70]
+        lines += [
+            f"Status       : {reflection['status']}",
+            f"Failure type : {reflection['failure_type']}",
+            f"Root cause   : {reflection['root_cause']}",
+            f"Patch        : {reflection['patch_analysis']}",
+            f"Failed tests : {', '.join(reflection['failed_tests']) or '(none)'}",
+            "Suggested    :",
+            *[f"  - {change}" for change in reflection["suggested_changes"]],
+            f"Guidance     : {reflection['repair_guidance']}",
+            f"Confidence   : {reflection['confidence']}",
+        ]
 
     lines += ["", "=" * 70, "TRACE", "=" * 70]
     lines += [f"{entry['agent']:<22} {entry['summary']}" for entry in report["trace"]]

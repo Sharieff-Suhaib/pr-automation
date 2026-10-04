@@ -477,6 +477,17 @@ function render(report) {
         ).join("") +
         "</table></div>"
       : "") +
+    (report.reflections || []).map((r) =>
+      '<div class="card"><h2>Reflection on attempt ' + esc(r.attempt) + "</h2><dl>" +
+        "<dt>Status &middot; failure type &middot; source</dt><dd>" + esc(r.status) + " &middot; " +
+          esc(r.failure_type) + " &middot; " + esc(r.source) + " (confidence " + esc(r.confidence) + ")</dd>" +
+        "<dt>Root cause</dt><dd>" + esc(r.root_cause) + "</dd>" +
+        "<dt>Previous patch</dt><dd>" + esc(r.patch_analysis) + "</dd>" +
+        "<dt>Failed tests</dt><dd>" + bullets(r.failed_tests, "mono") + "</dd>" +
+        "<dt>Suggested changes</dt><dd>" + bullets(r.suggested_changes) + "</dd>" +
+        "<dt>Guidance</dt><dd>" + esc(r.repair_guidance) + "</dd>" +
+      "</dl></div>"
+    ).join("") +
     '<div class="card"><h2>Trace</h2><table>' +
     (report.trace || []).map((entry) =>
       '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"

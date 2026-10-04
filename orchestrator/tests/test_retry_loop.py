@@ -66,6 +66,8 @@ def run(tmp_path, monkeypatch):
     shutil.copytree(SAMPLE_REPO, repo)
     monkeypatch.setattr(adapters, "WORKSPACES_DIR", tmp_path / "workspaces")
     monkeypatch.setattr(adapters, "TEST_ENVS_DIR", tmp_path / "test_envs")
+    # The Reflection Agent's model: fails, so the rule-based reflection is used.
+    monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: "not json")
     monkeypatch.setattr(
         adapters,
         "analyze_repository",
@@ -93,6 +95,48 @@ def run(tmp_path, monkeypatch):
         return solve_issue(repo_url=str(repo), issue="get_user crashes on unknown users", **kwargs)
 
     return solve
+
+
+def test_reflection_runs_on_failure_and_its_guidance_reaches_the_coder(run, monkeypatch):
+    prompts = []
+    reply = ('{"root_cause": "login no longer checks the password", "repair_guidance": "Restore the '
+             'password comparison and only add the None check", "suggested_changes": ["keep the comparison"]}')
+    monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: prompts.append(prompt) or reply)
+    coder = FakeCoder(BREAKS_LOGIN, FIX_PATCH)
+
+    report = run(coder)
+
+    assert report["status"] == "solved"  # the successful retry leaves the loop
+    assert len(report["reflections"]) == 1  # reflection after attempt 1 only
+    reflection = report["reflection"]
+    assert (reflection["status"], reflection["failure_type"], reflection["source"]) == ("retry", "regression", "llm")
+    assert reflection["failed_tests"] == ["test_users::test_login_succeeds_for_valid_credentials"]
+    assert "Previous patch" not in prompts[0] and "PATCH THAT FAILED" in prompts[0]
+    assert coder.feedback[1].startswith("This is a repair retry. The previous patch failed validation.")
+    assert "Root cause: login no longer checks the password" in coder.feedback[1]
+    assert "do not break these" in coder.feedback[1]  # the testing agent's feedback is kept too
+    agents = [entry["agent"] for entry in report["trace"]]
+    assert agents[-4:] == ["testing_agent", "reflection_agent", "coding_agent", "testing_agent"]
+
+
+def test_a_solved_first_attempt_never_reflects(run, monkeypatch):
+    calls = []
+    monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: calls.append(prompt) or "{}")
+
+    report = run(FakeCoder(FIX_PATCH))
+
+    assert report["status"] == "solved"
+    assert report["reflections"] == [] and calls == []
+    assert "reflection_agent" not in [entry["agent"] for entry in report["trace"]]
+
+
+def test_the_last_failure_is_reflected_on_and_then_the_run_stops(run):
+    report = run(FakeCoder(BREAKS_LOGIN, BREAKS_LOGIN, BREAKS_LOGIN), max_attempts=3)
+
+    assert [row["attempt"] for row in report["attempts"]] == [1, 2, 3]
+    assert [r["status"] for r in report["reflections"]] == ["retry", "retry", "max_retries"]
+    assert report["status"] == "failed"
+    assert report["trace"][-1]["agent"] == "reflection_agent"
 
 
 def test_a_broken_first_patch_is_retried_with_feedback_and_solved(run):

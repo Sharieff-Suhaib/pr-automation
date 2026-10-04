@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from orchestrator import adapters
 from orchestrator.github_issues import DEFAULT_LIMIT, GitHubError, fetch_issues
 from orchestrator.manager_agent import solve_issue
+from orchestrator.state import DEFAULT_MAX_ATTEMPTS
 from orchestrator.run_demo import SAMPLE_ISSUE, SAMPLE_PATCH, SAMPLE_REPO, SAMPLE_REPRO
 
 INDEX_HTML = Path(__file__).resolve().parent / "static" / "index.html"
@@ -56,7 +57,9 @@ class SolveRequest(BaseModel):
     )
     stub_patch_path: str = Field("", description="Fixture diff, used only when codegen_backend='stub'")
     reproduce: bool = Field(True, description="Write a test reproducing the issue before patching")
-    max_attempts: int = Field(3, ge=1, le=5, description="Patches to try before giving up")
+    max_attempts: int = Field(
+        DEFAULT_MAX_ATTEMPTS, ge=1, le=10, description="Patches to try before giving up"
+    )
     isolated_env: bool = Field(True, description="Run tests in a cached venv with the repo's dependencies")
     stub_repro_path: str = Field(
         "", description="Fixture reproduction test, used only when codegen_backend='stub'"
@@ -102,6 +105,8 @@ class SolveResponse(BaseModel):
     baseline_result: dict[str, Any] = {}
     test_verdict: dict[str, Any] = {}
     attempts: list[dict[str, Any]] = []
+    reflection: dict[str, Any] = {}
+    reflections: list[dict[str, Any]] = []
     errors: list[str] = []
     trace: list[dict[str, Any]] = []
 

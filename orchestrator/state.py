@@ -12,7 +12,11 @@ runs them in.
 from __future__ import annotations
 
 import operator
+import os
 from typing import Annotated, Any, TypedDict
+
+# Patches to try per issue (the repair retry limit); MAX_REPAIR_ATTEMPTS in the brief.
+DEFAULT_MAX_ATTEMPTS = int(os.environ.get("AGENT_SWE_MAX_REPAIR_ATTEMPTS", "3"))
 
 
 class AgentState(TypedDict, total=False):
@@ -68,6 +72,12 @@ class AgentState(TypedDict, total=False):
     test_feedback: str  # why the latest attempt was rejected; read by coding_agent
     best_attempt: dict[str, Any]  # the best attempt so far; reported if none is solved
     attempts: Annotated[list[dict[str, Any]], operator.add]  # one summary per attempt
+    last_attempt: dict[str, Any]  # the full record of the attempt just tested
+
+    # --- Reflection Agent ---
+    # Analysis of the latest failed attempt; its feedback is prepended to `test_feedback`.
+    reflection: dict[str, Any]
+    reflections: Annotated[list[dict[str, Any]], operator.add]  # one per failed attempt
 
     # --- Control / configuration ---
     top_k: int
@@ -92,7 +102,7 @@ def new_state(
     stub_patch_path: str = "",
     reproduce: bool = True,
     stub_repro_path: str = "",
-    max_attempts: int = 3,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     isolated_env: bool = True,
 ) -> AgentState:
     """Build the initial state for one repair run."""
@@ -108,6 +118,7 @@ def new_state(
         isolated_env=isolated_env,
         attempt=0,
         attempts=[],
+        reflections=[],
         status="running",
         trace=[],
         errors=[],
