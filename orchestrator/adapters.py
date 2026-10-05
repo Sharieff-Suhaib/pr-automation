@@ -102,35 +102,63 @@ def _discard_incomplete_clone(repo_url: str) -> None:
         shutil.rmtree(destination, ignore_errors=True)
 
 
-def analyze_repository(repo_url: str, issue: str, top_k: int = DEFAULT_TOP_K) -> dict[str, Any]:
-    """Clone/locate the repo, index its code, and retrieve the chunks matching `issue`.
+def analyze_repository(
+    repo_url: str,
+    issue: str = "",
+    top_k: int = DEFAULT_TOP_K,
+) -> dict[str, Any]:
+    """Clone/locate a repository and retrieve relevant source-code chunks.
 
-    Returns `{"repo_path", "relevant_code", "relevant_files", "language",
-    "indexed_chunks"}`, where `relevant_code` holds Member 1's node dicts
-    (file, language, type, name, start_line, end_line, code, distance).
+    If issue is empty, a generic fault-localization query is used.
     """
+
     repo_path = resolve_repository(repo_url)
 
+    search_query = issue.strip()
+
+    if not search_query:
+        search_query = (
+            "Find potentially faulty, incomplete, suspicious, or buggy "
+            "code in this repository. Prioritize TODO comments, commented "
+            "out code, missing return statements, incorrect conditions, "
+            "unhandled errors, and incomplete functions."
+        )
+
     _ensure_import_paths()
+
     try:
-        from code_parser import extract_code_nodes, get_source_files  # noqa: PLC0415
-        from vector_store import VectorStore  # noqa: PLC0415
-    except ImportError as error:  # pragma: no cover - depends on the environment
-        raise AdapterError(f"Repository agent is unavailable: {error}") from error
+        from code_parser import (
+            extract_code_nodes,
+            get_source_files,
+        )
+        from vector_store import VectorStore
+    except ImportError as error:
+        raise AdapterError(
+            f"Repository agent is unavailable: {error}"
+        ) from error
 
     source_files = get_source_files(repo_path)
 
     nodes: list[dict[str, Any]] = []
+
     for source_file in source_files:
         try:
-            nodes.extend(extract_code_nodes(source_file, repo_path))
+            nodes.extend(
+                extract_code_nodes(
+                    source_file,
+                    repo_path,
+                )
+            )
         except Exception:
-            # One unparseable file must not abandon the whole repository.
+            # One unparseable file must not stop repository analysis.
             continue
 
-    # Classes are dropped: their bodies duplicate the methods already indexed,
-    # which would otherwise crowd out the real matches.
-    chunks = [node for node in nodes if node.get("type") != "class"]
+    chunks = [
+        node
+        for node in nodes
+        if node.get("type") != "class"
+    ]
+
     if not chunks:
         return {
             "repo_path": repo_path,
@@ -138,22 +166,38 @@ def analyze_repository(repo_url: str, issue: str, top_k: int = DEFAULT_TOP_K) ->
             "relevant_files": [],
             "language": "",
             "indexed_chunks": 0,
+            "issue": search_query,
         }
 
     embedder = _get_embedder()
+
     embeddings = embedder.embed_nodes(chunks)
 
     store = VectorStore(embeddings.shape[1])
     store.add(embeddings, chunks)
 
-    results = store.search(embedder.embed_query(issue), top_k=min(top_k, len(chunks)))
+    results = store.search(
+        embedder.embed_query(search_query),
+        top_k=min(top_k, len(chunks)),
+    )
 
     return {
         "repo_path": repo_path,
         "relevant_code": results,
-        "relevant_files": _unique([result["file"] for result in results]),
-        "language": results[0]["language"] if results else "",
+        "relevant_files": _unique(
+            [
+                result["file"]
+                for result in results
+                if result.get("file")
+            ]
+        ),
+        "language": (
+            results[0]["language"]
+            if results
+            else ""
+        ),
         "indexed_chunks": len(chunks),
+        "issue": search_query,
     }
 
 
