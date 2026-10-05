@@ -43,8 +43,17 @@ class AdapterError(RuntimeError):
 
 
 def _ensure_import_paths() -> None:
-    """Put the project root and Member 1's flat module directory on sys.path."""
-    for path in (str(PROJECT_ROOT), str(REPO_AGENT_DIR)):
+    """Add the project and legacy flat-import directories used by the agents.
+
+    Some repository modules import siblings by bare filenames (for example
+    ``from fault_localization import ...``), so the directory containing those
+    modules also has to be added to ``sys.path`` before those imports run.
+    """
+    for path in (
+        str(PROJECT_ROOT),
+        str(REPO_AGENT_DIR),
+        str(PROJECT_ROOT / "src" / "agents" / "coding_agent"),
+    ):
         if path not in sys.path:
             sys.path.append(path)
 
@@ -304,6 +313,24 @@ def generate_patch(
         except PatchGenerationError as error:
             function_error = str(error)
 
+    fault_error = ""
+    if repo_path:
+        try:
+            from src.agents.coding_agent import generate_patch_from_repository  # noqa: PLC0415
+
+            patch = generate_patch_from_repository(
+                repo_url=repo_path,
+                issue=issue,
+                similar_bugs=[f"{bug['issue']} -> {bug['fix']}" for bug in similar_bugs],
+                strategy=strategy,
+                tools=tools,
+                tests=tests,
+                top_k=max(3, min(8, len(relevant_chunks or []) or 4)),
+            )
+            return patch, "ollama-fault-localization"
+        except (ImportError, PatchGenerationError, Exception) as error:
+            fault_error = str(error)
+
     try:
         patch = run_codegen(
             issue=f"{issue}\n\nPREVIOUS ATTEMPT:\n{feedback}" if feedback else issue,
@@ -314,8 +341,9 @@ def generate_patch(
             tests=tests,
         )
     except PatchGenerationError as error:
-        if function_error:
-            raise AdapterError(f"function mode: {function_error}; diff mode: {error}") from error
+        combined = [part for part in (function_error, fault_error, str(error)) if part]
+        if combined:
+            raise AdapterError("; ".join(combined)) from error
         raise AdapterError(str(error)) from error
 
     return patch, "ollama"

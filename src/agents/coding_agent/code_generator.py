@@ -10,9 +10,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+_CODEGEN_DIR = Path(__file__).resolve().parent
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
+from fault_localization import SuspiciousRegion, run_fault_localization
 
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -91,6 +99,67 @@ def generate_patch(
         # before treating it as an unusable patch.
         response = _call_ollama(_diff_format_retry_prompt(prompt))
         return _clean_patch(response)
+
+
+def generate_patch_from_repository(
+    repo_url: str,
+    issue: str = "",
+    similar_bugs: Any = None,
+    strategy: Any = None,
+    tools: Any = None,
+    tests: Any = None,
+    top_k: int = 4,
+) -> str:
+    """Localize suspicious regions, then generate a patch for those regions.
+
+    This is the repository-level entry point for callers that do not already
+    have relevant code. Fault localization is deliberately performed before
+    contacting Ollama so the model receives the ranked source regions and their
+    IR4 representations rather than an unbounded repository dump.
+    """
+    if not repo_url.strip():
+        raise PatchGenerationError("A repository URL or path is required.")
+
+    regions = run_fault_localization(
+        repo_url=repo_url,
+        issue=issue,
+        top_k=top_k,
+    )
+    if not regions:
+        raise PatchGenerationError(
+            "Fault localization found no suspicious regions to repair."
+        )
+
+    relevant_code = format_fault_localization_results(regions)
+    return generate_patch(
+        issue=issue,
+        relevant_code=relevant_code,
+        similar_bugs=similar_bugs,
+        strategy=strategy,
+        tools=tools,
+        tests=tests,
+    )
+
+
+def format_fault_localization_results(
+    regions: list[SuspiciousRegion],
+) -> str:
+    """Format localized regions as bounded, file-labelled model context."""
+    sections: list[str] = []
+    for index, region in enumerate(regions, start=1):
+        sections.append(
+            f"""REGION {index}
+FILE: {region.file}
+SUSPICIOUS LINES: {region.start_line}-{region.end_line}
+SCORE: {region.score:.4f}
+
+ORIGINAL SUSPICIOUS CODE:
+{region.original_code}
+
+IR4 REPRESENTATION:
+{region.ir4}"""
+        )
+    return "\n\n".join(sections)
 
 
 def _format_value(value: Any) -> str:
