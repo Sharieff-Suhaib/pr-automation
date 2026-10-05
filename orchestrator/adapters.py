@@ -21,7 +21,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +28,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../pr-automation
 REPO_AGENT_DIR = PROJECT_ROOT / "src" / "agents" / "repository-agent"
 REPOSITORIES_DIR = PROJECT_ROOT / "repositories"
 WORKSPACES_DIR = PROJECT_ROOT / "workspaces"
+TEST_ENVS_DIR = PROJECT_ROOT / ".test_envs"
+# How many patched working copies and cached test environments survive a cleanup.
+KEEP_WORKSPACES = int(os.environ.get("AGENT_SWE_KEEP_WORKSPACES", "20"))
+KEEP_TEST_ENVS = int(os.environ.get("AGENT_SWE_KEEP_TEST_ENVS", "5"))
 
 DEFAULT_TOP_K = 5
+# Sampling temperature per attempt; later attempts explore more. Past the end, the last value.
+ATTEMPT_TEMPERATURES = (0.0, 0.4, 0.8)
 
 
 class AdapterError(RuntimeError):
@@ -248,6 +253,10 @@ def generate_patch(
     tests: list[str],
     backend: str = "ollama",
     stub_patch_path: str = "",
+    repo_path: str = "",
+    relevant_chunks: list[dict[str, Any]] | None = None,
+    feedback: str = "",
+    attempt: int = 1,
 ) -> tuple[str, str]:
     """Return `(unified_diff, source)` for the repair.
 
@@ -255,6 +264,17 @@ def generate_patch(
     calling the model. It exists so the whole graph can be exercised on a
     machine without Ollama -- the returned patch is a checked-in fixture, not a
     generated repair, and the caller records that in `patch_source`.
+
+    With the model, the function mode runs first: the model returns corrected
+    functions and the diff is computed locally, so it always applies (source
+    `ollama-function`). If that yields nothing usable, the model is asked to
+    write the diff itself (source `ollama`).
+
+    `feedback` (retry loop) says why the previous attempt was rejected. The
+    diff mode's interface has no slot for it, so it is appended to the issue.
+    From `attempt` 2 on, the function mode samples at a rising temperature
+    (`ATTEMPT_TEMPERATURES`): at temperature 0 a local model tends to return
+    the rejected patch verbatim.
     """
     if backend == "stub":
         return _load_stub_patch(stub_patch_path), "stub"
@@ -263,12 +283,30 @@ def generate_patch(
     try:
         from src.agents.coding_agent import generate_patch as run_codegen  # noqa: PLC0415
         from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
+        from src.agents.coding_agent.function_patch import generate_function_patch  # noqa: PLC0415
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise AdapterError(f"Coding agent is unavailable: {error}") from error
 
+    function_error = ""
+    if repo_path and relevant_chunks:
+        try:
+            patch = generate_function_patch(
+                issue=issue,
+                repo_path=repo_path,
+                chunks=relevant_chunks,
+                similar_bugs=[f"{bug['issue']} -> {bug['fix']}" for bug in similar_bugs],
+                strategy=strategy,
+                tests=tests,
+                feedback=feedback,
+                temperature=ATTEMPT_TEMPERATURES[min(attempt, len(ATTEMPT_TEMPERATURES)) - 1],
+            )
+            return patch, "ollama-function"
+        except PatchGenerationError as error:
+            function_error = str(error)
+
     try:
         patch = run_codegen(
-            issue=issue,
+            issue=f"{issue}\n\nPREVIOUS ATTEMPT:\n{feedback}" if feedback else issue,
             relevant_code=relevant_code,
             similar_bugs=[f"{bug['issue']} -> {bug['fix']}" for bug in similar_bugs],
             strategy=strategy,
@@ -276,6 +314,8 @@ def generate_patch(
             tests=tests,
         )
     except PatchGenerationError as error:
+        if function_error:
+            raise AdapterError(f"function mode: {function_error}; diff mode: {error}") from error
         raise AdapterError(str(error)) from error
 
     return patch, "ollama"
@@ -292,10 +332,13 @@ def format_relevant_code(relevant_code: list[dict[str, Any]], limit: int = 3) ->
     """Render retrieved chunks for the repair prompt, keeping the file paths visible.
 
     The model has to emit `--- a/<file>` headers, so the path of each chunk is
-    stated right above its code.
+    stated right above its code. Test files are left out whenever any source
+    chunk was retrieved: shown a test, the model tends to rewrite the test
+    instead of the code (and small models then loop on repeated test hunks).
     """
+    source_chunks = [chunk for chunk in relevant_code if not _is_test_file(chunk["file"])]
     blocks = []
-    for chunk in relevant_code[:limit]:
+    for chunk in (source_chunks or relevant_code)[:limit]:
         blocks.append(
             f"File: {chunk['file']} (lines {chunk['start_line']}-{chunk['end_line']}, "
             f"{chunk['type']} {chunk['name']})\n{chunk['code']}"
@@ -304,68 +347,170 @@ def format_relevant_code(relevant_code: list[dict[str, Any]], limit: int = 3) ->
 
 
 # --------------------------------------------------------------------------
-# Member 3 -- Testing Agent (apply the patch, run the suite)
+# Testing Agent (baseline run, patched run, before/after verdict)
 # --------------------------------------------------------------------------
 
 
-def apply_and_test(repo_path: str, patch: str, language: str = "") -> dict[str, Any]:
-    """Copy the repo, apply `patch` to the copy, and run its native test suite.
+def prepare_test_environment(repo_path: str, enabled: bool = True) -> dict[str, Any]:
+    """Clean up old workspaces and environments, then build or reuse this repo's test environment.
 
-    The original clone is never modified: `apply_patch` refuses to write into an
-    existing destination, so every run gets its own timestamped working copy.
+    Returns `TestEnvironment.to_dict()` plus `removed`, the directories deleted.
     """
     _ensure_import_paths()
     try:
-        from src.agents.coding_agent.patch_manager import apply_patch  # noqa: PLC0415
-        from src.agents.coding_agent.tester import run_tests  # noqa: PLC0415
+        from src.agents.testing_agent.environment import (  # noqa: PLC0415
+            cleanup_directories,
+            prepare_environment,
+        )
     except ImportError as error:  # pragma: no cover - depends on the environment
-        raise AdapterError(f"Coding agent is unavailable: {error}") from error
+        raise AdapterError(f"Testing agent is unavailable: {error}") from error
 
-    working_repo = _new_workspace(repo_path)
-    patch_result = apply_patch(repo_path, working_repo, patch)
-
-    if patch_result.status != "APPLIED":
-        return {
-            "working_repo": patch_result.working_repo,
-            "changed_files": [],
-            "patch_status": patch_result.status,
-            "test_result": {
-                "status": "SKIPPED",
-                "passed": 0,
-                "failed": 0,
-                "errors": [patch_result.error or "The patch could not be applied."],
-                "output": "",
-            },
-        }
-
-    # Recommended test *names* are suggestions, not pytest node ids, so the whole
-    # suite is run instead; passing them through would make pytest fail to collect.
-    test_result = run_tests(patch_result.working_repo, language=language or None)
-
-    return {
-        "working_repo": patch_result.working_repo,
-        "changed_files": patch_result.changed_files,
-        "patch_status": patch_result.status,
-        "test_result": test_result.to_dict(),
-    }
+    removed = cleanup_directories(WORKSPACES_DIR, keep=KEEP_WORKSPACES)
+    removed += cleanup_directories(TEST_ENVS_DIR, keep=KEEP_TEST_ENVS)
+    environment = prepare_environment(repo_path, TEST_ENVS_DIR, enabled=enabled).to_dict()
+    return {**environment, "removed": removed}
 
 
-def run_baseline_tests(repo_path: str, language: str = "") -> dict[str, Any]:
-    """Run the suite on the unpatched repository, for when no patch was produced."""
+def run_baseline_tests(repo_path: str, language: str = "", python: str | None = None) -> dict[str, Any]:
+    """Run the suite on a throwaway copy of the unpatched repository."""
     _ensure_import_paths()
     try:
-        from src.agents.coding_agent.tester import run_tests  # noqa: PLC0415
+        from src.agents.testing_agent import run_baseline  # noqa: PLC0415
     except ImportError as error:  # pragma: no cover - depends on the environment
-        raise AdapterError(f"Coding agent is unavailable: {error}") from error
+        raise AdapterError(f"Testing agent is unavailable: {error}") from error
 
-    return run_tests(repo_path, language=language or None).to_dict()
+    return run_baseline(repo_path, WORKSPACES_DIR, language=language, python=python)
 
 
-def _new_workspace(repo_path: str) -> Path:
-    """A fresh, non-existent directory outside the source repository."""
-    WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return WORKSPACES_DIR / f"{Path(repo_path).name}-{stamp}"
+def prepare_reproduction(
+    repo_path: str,
+    issue: str,
+    relevant_code: list[dict[str, Any]],
+    language: str = "",
+    backend: str = "ollama",
+    stub_repro_path: str = "",
+    python: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Write and validate a test reproducing the issue; return `(reproduction, baseline)`.
+
+    `backend="stub"` replays the test at `stub_repro_path` instead of calling the
+    model, mirroring `generate_patch`. The baseline is always returned, with the
+    reproduction test included only when it was accepted.
+    """
+    _ensure_import_paths()
+    try:
+        from src.agents.testing_agent import (  # noqa: PLC0415
+            ollama_writer,
+            prepare_reproduction as run_reproduction,
+            stub_writer,
+        )
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise AdapterError(f"Testing agent is unavailable: {error}") from error
+
+    write = stub_writer(stub_repro_path) if backend == "stub" else ollama_writer()
+    reproduction, baseline = run_reproduction(
+        repo_path, issue, relevant_code, WORKSPACES_DIR, write, language=language, python=python
+    )
+    reproduction["source_of"] = "stub" if backend == "stub" else "ollama"
+    return reproduction, baseline
+
+
+def apply_and_test(
+    repo_path: str,
+    patch: str,
+    language: str = "",
+    baseline: dict[str, Any] | None = None,
+    reproduction: dict[str, Any] | None = None,
+    python: str | None = None,
+) -> dict[str, Any]:
+    """Apply `patch` to a fresh copy of the repo, run the suite, and compare with `baseline`.
+
+    The original clone is never modified: every run gets its own timestamped
+    working copy under `workspaces/`. Recommended test *names* are suggestions,
+    not pytest node ids, so the whole suite is run. An accepted `reproduction`
+    test is added to the copy, as it was for the baseline.
+    """
+    _ensure_import_paths()
+    try:
+        from src.agents.testing_agent import evaluate_patch  # noqa: PLC0415
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise AdapterError(f"Testing agent is unavailable: {error}") from error
+
+    accepted = bool(reproduction) and reproduction.get("status") == "accepted"
+    return evaluate_patch(
+        repo_path,
+        patch,
+        WORKSPACES_DIR,
+        language=language,
+        baseline=baseline,
+        extra_files={reproduction["path"]: reproduction["source"]} if accepted else None,
+        reproduction_tests=reproduction["tests"] if accepted else None,
+        python=python,
+    )
+
+
+def attempt_feedback(attempt: dict[str, Any], earlier_patches: list[str] | None = None) -> str:
+    """Why a tested attempt was rejected, phrased for the coding agent's next try."""
+    _ensure_import_paths()
+    from src.agents.testing_agent.feedback import build_feedback  # noqa: PLC0415
+
+    return build_feedback(
+        attempt["attempt"],
+        attempt["patch"],
+        attempt["patch_status"],
+        attempt["test_result"],
+        attempt["test_verdict"],
+        patch_error=attempt.get("patch_error", ""),
+        repeated=bool(attempt["patch"].strip()) and attempt["patch"] in (earlier_patches or []),
+    )
+
+
+# The Reflection Agent's model: None uses the coding agent's Ollama model. Tests
+# replace it with a fake callable (prompt -> reply).
+REFLECTION_LLM = None
+
+
+def reflect(
+    issue: str,
+    relevant_code: str,
+    attempt: dict[str, Any],
+    strategy: str = "",
+    previous_attempts: list[dict[str, Any]] | None = None,
+    max_attempts: int = 3,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    """Run the Reflection Agent on one tested attempt; returns `ReflectionResult.to_dict()`
+    plus `feedback`, the text the coding agent receives next."""
+    _ensure_import_paths()
+    try:
+        from src.agents.reflection_agent import ReflectionAgent  # noqa: PLC0415
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise AdapterError(f"Reflection agent is unavailable: {error}") from error
+
+    result = ReflectionAgent(llm=REFLECTION_LLM, use_llm=use_llm).reflect(
+        issue=issue,
+        relevant_code=relevant_code,
+        generated_patch=attempt.get("patch", ""),
+        test_results=attempt,
+        repair_strategy=strategy,
+        previous_attempts=previous_attempts,
+        attempt=attempt.get("attempt", 1),
+        max_attempts=max_attempts,
+    )
+    return {**result.to_dict(), "feedback": result.as_feedback()}
+
+
+def is_better_attempt(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
+    """Whether `candidate` should replace `current` as the attempt to report."""
+    _ensure_import_paths()
+    from src.agents.testing_agent.feedback import is_better  # noqa: PLC0415
+
+    return is_better(candidate, current)
+
+
+def _is_test_file(file_path: str) -> bool:
+    name = Path(file_path).name
+    return name.startswith("test_") or name.endswith(("_test.py", ".test.js", ".spec.js", ".test.ts", ".spec.ts"))
 
 
 def _unique(items: list[str]) -> list[str]:

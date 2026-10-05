@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 TEST_TIMEOUT_SECONDS = 300
@@ -57,12 +58,14 @@ def run_tests(
     tests: Sequence[str] | None = None,
     language: str | None = None,
     command: Sequence[str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> TestResult:
     """Run a native test command in ``working_repo``.
 
     The framework is detected from project files unless ``language`` is given.
     Use ``command`` for an unsupported language or custom project command.
     Focused ``tests`` are supported for Python and JavaScript/TypeScript.
+    ``env`` adds environment variables for the test command.
     """
     repository = Path(working_repo).resolve()
     if not repository.is_dir():
@@ -89,6 +92,7 @@ def run_tests(
             capture_output=True,
             timeout=TEST_TIMEOUT_SECONDS,
             check=False,
+            env={**os.environ, **env} if env else None,
         )
     except subprocess.TimeoutExpired as error:
         output = _combine_output(error.stdout, error.stderr)

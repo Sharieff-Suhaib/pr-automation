@@ -16,6 +16,7 @@
     --pass: #148a3c;
     --fail: #c02626;
     --skip: #8a8f98;
+    --warn: #b26b00;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -124,6 +125,8 @@
   .is-skip .dot { background: var(--skip); }
   .is-pass strong { color: var(--pass); }
   .is-fail strong { color: var(--fail); }
+  .is-warn .dot { background: var(--warn); }
+  .is-warn strong { color: var(--warn); }
 
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
@@ -330,6 +333,7 @@ $("form").addEventListener("submit", async (event) => {
     top_k: Number($("top_k").value) || 5,
     codegen_backend: offline ? "stub" : "ollama",
     stub_patch_path: offline ? demo.stub_patch_path : "",
+    stub_repro_path: offline ? demo.stub_repro_path : "",
   };
 
   $("run").disabled = true;
@@ -354,12 +358,19 @@ $("form").addEventListener("submit", async (event) => {
   }
 });
 
+// "PASS (4 passed, 0 failed)" for one run of the suite.
+function runSummary(result) {
+  if (!result || !result.status) return "not run";
+  return result.status + " (" + (result.passed || 0) + " passed, " + (result.failed || 0) + " failed)";
+}
+
 function render(report) {
   const test = report.test_result || {};
-  const passed = test.passed || 0;
-  const failed = test.failed || 0;
-  const state = report.test_status === "PASS" ? "is-pass"
-              : report.test_status === "FAIL" ? "is-fail"
+  const baseline = report.baseline_result || {};
+  const verdict = report.test_verdict || {};
+  const state = report.status === "solved" ? "is-pass"
+              : report.status === "unverified" ? "is-warn"
+              : report.status === "failed" ? "is-fail"
               : "is-skip";
 
   let html =
@@ -367,8 +378,8 @@ function render(report) {
       '<span class="dot"></span>' +
       "<strong>" + esc(report.status.toUpperCase()) + "</strong>" +
       '<span class="detail">patch ' + esc(report.patch_status) +
-        " &middot; tests " + esc(report.test_status) +
-        " (" + passed + " passed, " + failed + " failed)" +
+        " &middot; before " + esc(runSummary(baseline)) +
+        " &rarr; after " + esc(runSummary(test)) +
         " &middot; patch source: " + esc(report.patch_source) +
       "</span>" +
     "</div>";
@@ -401,20 +412,82 @@ function render(report) {
       : '<p class="empty">none</p>') +
     "</div>";
 
+  const repro = report.reproduction || {};
+  const reproAfter = verdict.reproduction || {};
+  html +=
+    '<div class="card"><h2>Reproduction test</h2>' +
+    (repro.status
+      ? "<dl>" +
+          "<dt>Status</dt><dd>" + esc(repro.status) + " (" + esc(repro.source_of || "?") + ", " +
+            esc(repro.attempts) + " attempt(s))</dd>" +
+          "<dt>Why</dt><dd>" + esc(repro.reason) + "</dd>" +
+          "<dt>Before &rarr; after the patch</dt><dd>" +
+            bullets(Object.entries(repro.baseline_outcomes || {}).map(([id, before]) =>
+              id + ": " + before + (reproAfter[id] ? " → " + reproAfter[id] : "")), "mono") +
+          "</dd>" +
+        "</dl>" +
+        (repro.source ? "<details><summary>" + esc(repro.path) + "</summary><pre>" + esc(repro.source) + "</pre></details>" : "")
+      : '<p class="empty">not written</p>') +
+    "</div>";
+
   html +=
     '<div class="card"><h2>Patch</h2>' +
     (report.patch ? "<pre>" + colourDiff(report.patch) + "</pre>" : '<p class="empty">no patch generated</p>') +
     "</div>";
 
+  const added = Object.entries(verdict.added || {}).map(([id, outcome]) => id + " (" + outcome + ")");
+  html +=
+    '<div class="card"><h2>Test verdict</h2><dl>' +
+      "<dt>Verdict</dt><dd>" + (esc(verdict.reason) || '<span class="empty">not tested</span>') + "</dd>" +
+      "<dt>Fixed (fail &rarr; pass)</dt><dd>" + bullets(verdict.fail_to_pass, "mono") + "</dd>" +
+      "<dt>Broken (pass &rarr; fail)</dt><dd>" + bullets(verdict.pass_to_fail, "mono") + "</dd>" +
+      "<dt>Still failing</dt><dd>" + bullets(verdict.fail_to_fail, "mono") + "</dd>" +
+      "<dt>Still passing</dt><dd>" + (verdict.pass_to_pass || []).length + " test(s)</dd>" +
+      (added.length ? "<dt>Added by the patch</dt><dd>" + bullets(added, "mono") + "</dd>" : "") +
+    "</dl></div>";
+
   html +=
     '<div class="card"><h2>Test run</h2><dl><dt>Changed files</dt><dd class="mono">' +
     (esc((report.changed_files || []).join(", ")) || '<span class="empty">none</span>') +
-    "</dd></dl>" +
+    "</dd>" +
+    "<dt>Before patch</dt><dd>" + esc(runSummary(baseline)) + "</dd>" +
+    "<dt>After patch</dt><dd>" + esc(runSummary(test)) + "</dd>" +
+    ((test.stages || []).length
+      ? "<dt>Test stages</dt><dd>" + test.stages.map((stage) =>
+          esc(stage.name) + " " + esc(stage.status) +
+          ("passed" in stage ? " (" + stage.passed + "/" + (stage.passed + stage.failed) + ")" : "")
+        ).join(" &rarr; ") + "</dd>"
+      : "") +
+    "</dl>" +
     (test.errors && test.errors.length ? bullets(test.errors) : "") +
     (test.output ? "<pre>" + esc(test.output) + "</pre>" : "") +
+    (baseline.output
+      ? "<details><summary>Output before the patch</summary><pre>" + esc(baseline.output) + "</pre></details>"
+      : "") +
     "</div>";
 
   html +=
+    ((report.attempts || []).length > 1
+      ? '<div class="card"><h2>Attempts (retry loop)</h2><table>' +
+        report.attempts.map((row) =>
+          '<tr><td class="agent">' + esc(row.attempt) + ". " + esc(row.status) + "</td><td>" +
+            "patch " + esc(row.patch_status) + " via " + esc(row.patch_source) + ": " +
+            esc(row.fixed) + " fixed, " + esc(row.broken) + " broken &middot; " + esc(row.reason) +
+          "</td></tr>"
+        ).join("") +
+        "</table></div>"
+      : "") +
+    (report.reflections || []).map((r) =>
+      '<div class="card"><h2>Reflection on attempt ' + esc(r.attempt) + "</h2><dl>" +
+        "<dt>Status &middot; failure type &middot; source</dt><dd>" + esc(r.status) + " &middot; " +
+          esc(r.failure_type) + " &middot; " + esc(r.source) + " (confidence " + esc(r.confidence) + ")</dd>" +
+        "<dt>Root cause</dt><dd>" + esc(r.root_cause) + "</dd>" +
+        "<dt>Previous patch</dt><dd>" + esc(r.patch_analysis) + "</dd>" +
+        "<dt>Failed tests</dt><dd>" + bullets(r.failed_tests, "mono") + "</dd>" +
+        "<dt>Suggested changes</dt><dd>" + bullets(r.suggested_changes) + "</dd>" +
+        "<dt>Guidance</dt><dd>" + esc(r.repair_guidance) + "</dd>" +
+      "</dl></div>"
+    ).join("") +
     '<div class="card"><h2>Trace</h2><table>' +
     (report.trace || []).map((entry) =>
       '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"

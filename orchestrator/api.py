@@ -29,7 +29,8 @@ from pydantic import BaseModel, Field
 from orchestrator import adapters
 from orchestrator.github_issues import DEFAULT_LIMIT, GitHubError, fetch_issues
 from orchestrator.manager_agent import solve_issue
-from orchestrator.run_demo import SAMPLE_ISSUE, SAMPLE_PATCH, SAMPLE_REPO
+from orchestrator.state import DEFAULT_MAX_ATTEMPTS
+from orchestrator.run_demo import SAMPLE_ISSUE, SAMPLE_PATCH, SAMPLE_REPO, SAMPLE_REPRO
 
 INDEX_HTML = Path(__file__).resolve().parent / "static" / "index.html"
 
@@ -55,6 +56,14 @@ class SolveRequest(BaseModel):
         description="'ollama' generates a patch with the model; 'stub' replays a fixture diff",
     )
     stub_patch_path: str = Field("", description="Fixture diff, used only when codegen_backend='stub'")
+    reproduce: bool = Field(True, description="Write a test reproducing the issue before patching")
+    max_attempts: int = Field(
+        DEFAULT_MAX_ATTEMPTS, ge=1, le=10, description="Patches to try before giving up"
+    )
+    isolated_env: bool = Field(True, description="Run tests in a cached venv with the repo's dependencies")
+    stub_repro_path: str = Field(
+        "", description="Fixture reproduction test, used only when codegen_backend='stub'"
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -84,6 +93,8 @@ class SolveResponse(BaseModel):
     strategy: str = ""
     tools: list[str] = []
     tests: list[str] = []
+    test_env: dict[str, Any] = {}
+    reproduction: dict[str, Any] = {}
     patch: str = ""
     patch_source: str = "none"
     patch_status: str = "SKIPPED"
@@ -91,6 +102,11 @@ class SolveResponse(BaseModel):
     working_repo: str = ""
     test_status: str = "SKIPPED"
     test_result: dict[str, Any] = {}
+    baseline_result: dict[str, Any] = {}
+    test_verdict: dict[str, Any] = {}
+    attempts: list[dict[str, Any]] = []
+    reflection: dict[str, Any] = {}
+    reflections: list[dict[str, Any]] = []
     errors: list[str] = []
     trace: list[dict[str, Any]] = []
 
@@ -113,6 +129,10 @@ def solve(request: SolveRequest) -> dict[str, Any]:
         top_k=request.top_k,
         codegen_backend=request.codegen_backend,
         stub_patch_path=request.stub_patch_path,
+        reproduce=request.reproduce,
+        stub_repro_path=request.stub_repro_path,
+        max_attempts=request.max_attempts,
+        isolated_env=request.isolated_env,
     )
 
 
@@ -151,6 +171,7 @@ def sample() -> dict[str, Any]:
         "issue": SAMPLE_ISSUE,
         "codegen_backend": "stub",
         "stub_patch_path": str(SAMPLE_PATCH),
+        "stub_repro_path": str(SAMPLE_REPRO),
     }
 
 
