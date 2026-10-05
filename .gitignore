@@ -8,7 +8,7 @@ node_modules/
 outputs/
 data/processed/*
 !data/processed/humanevalfix_base.json
-
+D:\huggingface/
 src/agents/repository-agent/repositories/
 
 # Cloned repositories and the throwaway working copies each repair run patches.
