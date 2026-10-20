@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,22 @@ KEEP_TEST_ENVS = int(os.environ.get("AGENT_SWE_KEEP_TEST_ENVS", "5"))
 DEFAULT_TOP_K = 5
 # Sampling temperature per attempt; later attempts explore more. Past the end, the last value.
 ATTEMPT_TEMPERATURES = (0.0, 0.4, 0.8)
+# Build files that tie a repository to one language's test runner.
+BUILD_FILE_LANGUAGES = (
+    ("pom.xml", "java"),
+    ("build.gradle", "java"),
+    ("build.gradle.kts", "java"),
+    ("package.json", "javascript"),
+    ("go.mod", "go"),
+    ("Cargo.toml", "rust"),
+    ("CMakeLists.txt", "cpp"),
+    ("pyproject.toml", "python"),
+    ("setup.py", "python"),
+    ("setup.cfg", "python"),
+    ("pytest.ini", "python"),
+    ("tox.ini", "python"),
+    ("requirements.txt", "python"),
+)
 
 
 class AdapterError(RuntimeError):
@@ -205,10 +222,9 @@ def analyze_repository(
                 if result.get("file")
             ]
         ),
-        "language": (
-            results[0]["language"]
-            if results
-            else ""
+        "language": _repository_language(
+            repo_path,
+            results,
         ),
         "indexed_chunks": len(chunks),
         "issue": search_query,
@@ -534,6 +550,29 @@ def is_better_attempt(candidate: dict[str, Any], current: dict[str, Any] | None)
     from src.agents.testing_agent.feedback import is_better  # noqa: PLC0415
 
     return is_better(candidate, current)
+
+
+def _repository_language(repo_path: str, results: list[dict[str, Any]]) -> str:
+    """The language the repair targets, which also picks the test runner.
+
+    A build file for one of the retrieved languages decides it. Otherwise the
+    most common language among the retrieved chunks wins -- the top hit alone
+    is arbitrary in a mixed-language repo. Ties go to Python, the one language
+    that is testable (pytest, reproduction tests) without a build file, then
+    to the better-ranked language.
+    """
+    languages = [result["language"] for result in results if result.get("language")]
+    if not languages:
+        return ""
+    root = Path(repo_path)
+    for marker, language in BUILD_FILE_LANGUAGES:
+        if language in languages and (root / marker).exists():
+            return language
+    counts = Counter(languages)
+    return max(
+        languages,
+        key=lambda language: (counts[language], language == "python", -languages.index(language)),
+    )
 
 
 def _is_test_file(file_path: str) -> bool:

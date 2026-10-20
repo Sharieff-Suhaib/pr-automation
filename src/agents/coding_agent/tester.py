@@ -197,10 +197,15 @@ def _normalise_framework(language: str | None, repository: str | Path) -> str | 
         "c++": "cpp_cmake",
         "cpp": "cpp_cmake",
     }
+    language = language.lower()
+    # Maven/Gradle and CMake need a build file; without one, `mvn test` or
+    # `ctest` can only fail, so test whatever the repository does declare.
     if language == "java":
-        detected = detect_framework(repository)
-        return detected if detected and detected.startswith("java_") else "java_maven"
-    return aliases.get(language.lower(), language.lower())
+        return detect_framework(repository)
+    framework = aliases.get(language, language)
+    if framework == "cpp_cmake" and not (Path(repository) / "CMakeLists.txt").exists():
+        return detect_framework(repository)
+    return framework
 
 
 def _parse_summary(output: str) -> tuple[int, int, int]:

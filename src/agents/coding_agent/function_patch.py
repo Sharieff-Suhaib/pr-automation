@@ -162,19 +162,28 @@ def splice_functions(original: str, targets: list[dict[str, Any]], functions: di
             for line in _dedent(replacement).splitlines()
         ]
         lines[start:end] = new_lines
-    return "".join(lines)
+    repaired = "".join(lines)
+    # Keep a missing final newline missing, or the last line shows up as changed.
+    if not original.endswith("\n") and repaired.endswith("\n"):
+        repaired = repaired[:-1]
+    return repaired
 
 
 def make_diff(file_path: str, original: str, repaired: str) -> str:
     """A `git apply`-ready unified diff of one file."""
-    return "".join(
-        difflib.unified_diff(
-            original.splitlines(keepends=True),
-            repaired.splitlines(keepends=True),
-            fromfile=f"a/{file_path}",
-            tofile=f"b/{file_path}",
-        )
-    )
+    diff = []
+    for line in difflib.unified_diff(
+        original.splitlines(keepends=True),
+        repaired.splitlines(keepends=True),
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+    ):
+        diff.append(line)
+        # difflib leaves a last line without "\n" unterminated, which glues the
+        # next diff line onto it and makes `git apply` report a corrupt patch.
+        if not line.endswith("\n"):
+            diff.append("\n\\ No newline at end of file\n")
+    return "".join(diff)
 
 
 def _targets(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
