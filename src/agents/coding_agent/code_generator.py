@@ -89,9 +89,12 @@ def generate_patch(
     tests: Any,
 ) -> str:
     """Ask the configured LLM for a minimal unified-diff repair patch."""
+    print(f"Generating patch for issue: {issue}...")
     prompt = build_repair_prompt(issue, relevant_code, similar_bugs, strategy, tools, tests)
     response = _call_ollama(prompt)
+    print(f"Received patch response from model: {response[:200]}...")  # Print first 200 chars
     try:
+        
         return _clean_patch(response)
     except PatchGenerationError:
         # Smaller local models sometimes repair the code correctly but ignore
@@ -129,7 +132,7 @@ def generate_patch_from_repository(
         raise PatchGenerationError(
             "Fault localization found no suspicious regions to repair."
         )
-
+    print(f"Fault localization found {len(regions)} suspicious regions in {repo_url}.")
     relevant_code = format_fault_localization_results(regions)
     return generate_patch(
         issue=issue,
@@ -184,6 +187,7 @@ def _call_ollama(
             "prompt": prompt,
             "system": system,
             "stream": False,
+            "keep_alive": "30m",  # one run makes many calls; reloading the model costs seconds each time
             "options": {"temperature": temperature, "num_predict": MAX_PATCH_TOKENS},
         }
     ).encode("utf-8")
@@ -197,7 +201,8 @@ def _call_ollama(
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise PatchGenerationError(f"Ollama returned HTTP {exc.code}.") from exc
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise PatchGenerationError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise PatchGenerationError(
             f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama and pull {model}."

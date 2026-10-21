@@ -14,7 +14,7 @@ import pytest
 
 from orchestrator import adapters
 from orchestrator.adapters import AdapterError
-from orchestrator.manager_agent import solve_issue
+from orchestrator.manager_agent import resume_review, solve_issue
 
 ORCHESTRATOR_DIR = Path(__file__).resolve().parents[1]
 SAMPLE_REPO = ORCHESTRATOR_DIR / "sample_repo"
@@ -197,6 +197,36 @@ def test_a_solved_first_attempt_does_not_retry(run):
 
     assert report["status"] == "solved"
     assert len(report["attempts"]) == 1
+
+
+def test_the_final_patch_waits_for_review_and_is_pushed_only_when_approved(run, monkeypatch):
+    pushed = []
+    monkeypatch.setattr(adapters, "commit_and_push", lambda *args: pushed.append(args) or {"branch": "b"})
+
+    paused = run(FakeCoder(FIX_PATCH))
+    denied = resume_review(paused["review"]["thread_id"], False)  # what POST /review does
+    approved = run(FakeCoder(BREAKS_LOGIN, FIX_PATCH), reviewer=lambda review: review["patch"] == FIX_PATCH)
+
+    assert paused["review"]["pending"] and paused["push"] == {}
+    assert denied["review"] == {"approved": False} and denied["trace"][-1]["agent"] == "human_review"
+    assert approved["push"] == {"branch": "b"} and approved["trace"][-1]["agent"] == "commit_and_push"
+    assert [args[1] for args in pushed] == [FIX_PATCH]
+
+
+def test_a_background_run_reports_progress_then_waits_for_review(run, monkeypatch):
+    import time
+    from orchestrator.manager_agent import run_status, start_run
+
+    run(FakeCoder(FIX_PATCH))  # installs the fakes; the synchronous run itself is not used
+    monkeypatch.setattr(adapters, "generate_patch", FakeCoder(FIX_PATCH))
+    repo = adapters.analyze_repository("", "")["repo_path"]
+
+    thread_id = start_run(repo, "get_user crashes on unknown users", reproduce=False)
+    while (report := run_status(thread_id))["running"]:
+        time.sleep(0.2)
+
+    assert report["status"] == "solved" and report["review"]["pending"]
+    assert [entry["agent"] for entry in report["trace"]][-1] == "testing_agent"
 
 
 def test_the_stub_backend_never_retries(run):

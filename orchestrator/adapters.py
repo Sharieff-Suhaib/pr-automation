@@ -18,9 +18,15 @@ has -- one unavailable dependency should degrade the run, not kill it.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -36,7 +42,16 @@ KEEP_TEST_ENVS = int(os.environ.get("AGENT_SWE_KEEP_TEST_ENVS", "5"))
 
 DEFAULT_TOP_K = 5
 # Sampling temperature per attempt; later attempts explore more. Past the end, the last value.
-ATTEMPT_TEMPERATURES = (0.0, 0.4, 0.8)
+# Not 0: at 0-0.2 codellama:7b loops on one line until Ollama aborts it ("token
+# repeat limit reached"), which wastes the attempt.
+ATTEMPT_TEMPERATURES = (0.4, 0.6, 0.8)
+# The fine-tuned CodeLlama served from Colab through ngrok: one LoRA adapter per
+# language, both trained on IR4 -> OR2. Tried before Ollama; "" turns it off.
+REPAIR_MODEL_URL = os.environ.get(
+    "REPAIR_MODEL_URL", "https://marsupial-abnormal-unselect.ngrok-free.dev"
+).rstrip("/")
+# Unset: wait for the reply however long generation takes. Set it to cap the wait.
+REMOTE_TIMEOUT_SECONDS = float(os.environ["REPAIR_MODEL_TIMEOUT"]) if os.environ.get("REPAIR_MODEL_TIMEOUT") else None
 # Build files that tie a repository to one language's test runner.
 BUILD_FILE_LANGUAGES = (
     ("pom.xml", "java"),
@@ -105,6 +120,7 @@ def resolve_repository(repo_url: str) -> str:
 
     _ensure_import_paths()
     try:
+    
         from clone_repo import clone_repository  # noqa: PLC0415
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise AdapterError(f"Repository agent is unavailable: {error}") from error
@@ -113,6 +129,7 @@ def resolve_repository(repo_url: str) -> str:
     _discard_incomplete_clone(repo_url)
 
     try:
+        print(f"Cloning {repo_url} into {REPOSITORIES_DIR}...")
         return clone_repository(repo_url, base_path=str(REPOSITORIES_DIR))
     except Exception as error:  # GitPython raises several unrelated types
         raise AdapterError(f"Could not clone {repo_url}: {error}") from error
@@ -240,12 +257,15 @@ def recommend(issue: str, code: str = "", language: str = "python", top_k: int =
     """Run Member 2's pipeline and flatten its dataclasses into plain dicts."""
     _ensure_import_paths()
     try:
+        print(f"Running recommendation agent for issue: {issue}...")
         from src.agents.recommendation_agent import recommend as run_recommendation  # noqa: PLC0415
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise AdapterError(f"Recommendation agent is unavailable: {error}") from error
 
     result = run_recommendation(issue, code=code, language=language or "python", top_k=top_k)
-
+    if result is None:
+        raise AdapterError("Recommendation agent returned no result.")
+    print(f"Recommendation result: {result}")
     return {
         "similar_bugs": [
             {
@@ -283,23 +303,10 @@ def generate_patch(
     feedback: str = "",
     attempt: int = 1,
 ) -> tuple[str, str]:
-    """Return `(unified_diff, source)` for the repair.
+    """Return ``(unified_diff, source)`` for the repair.
 
-    `backend="stub"` reads a fixture diff from `stub_patch_path` instead of
-    calling the model. It exists so the whole graph can be exercised on a
-    machine without Ollama -- the returned patch is a checked-in fixture, not a
-    generated repair, and the caller records that in `patch_source`.
-
-    With the model, the function mode runs first: the model returns corrected
-    functions and the diff is computed locally, so it always applies (source
-    `ollama-function`). If that yields nothing usable, the model is asked to
-    write the diff itself (source `ollama`).
-
-    `feedback` (retry loop) says why the previous attempt was rejected. The
-    diff mode's interface has no slot for it, so it is appended to the issue.
-    From `attempt` 2 on, the function mode samples at a rising temperature
-    (`ATTEMPT_TEMPERATURES`): at temperature 0 a local model tends to return
-    the rejected patch verbatim.
+    Order: the remote IR4/OR2 model, then the function mode (Python and Java),
+    then -- Python only -- fault localization, and last the generic diff mode.
     """
     if backend == "stub":
         return _load_stub_patch(stub_patch_path), "stub"
@@ -312,25 +319,55 @@ def generate_patch(
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise AdapterError(f"Coding agent is unavailable: {error}") from error
 
+    temperature = ATTEMPT_TEMPERATURES[min(max(attempt, 1), len(ATTEMPT_TEMPERATURES)) - 1]
+    chunks = relevant_chunks or []
+    languages = [str(chunk.get("language", "")).lower() for chunk in chunks]
+    # Prefer Java when retrieved chunks include Java source; otherwise use the
+    # first detected language. This avoids sending Java methods to Python AST.
+    language = "java" if "java" in languages else (languages[0] if languages else "")
+
+    remote_error = ""
+    if REPAIR_MODEL_URL and repo_path and chunks:
+        try:
+            return remote_patch(repo_path, chunks, temperature), "remote-ir4"
+        except PatchGenerationError as error:
+            remote_error = str(error)
+            print(
+                f"Remote model unusable; trying local fallback: {remote_error[:200]}",
+                flush=True,
+            )
+        except Exception as error:
+            # Convert unexpected renderer/import/response failures into a useful
+            # fallback message instead of crashing the FastAPI request.
+            remote_error = f"Remote repair failed: {error}"
+            print(f"{remote_error[:250]}; trying local fallback", flush=True)
+
+    # Python (ast) and Java (tree-sitter): the model returns corrected functions,
+    # the diff is computed locally, so it always applies.
     function_error = ""
-    if repo_path and relevant_chunks:
+    if repo_path and chunks:
         try:
             patch = generate_function_patch(
                 issue=issue,
                 repo_path=repo_path,
-                chunks=relevant_chunks,
+                chunks=chunks,
                 similar_bugs=[f"{bug['issue']} -> {bug['fix']}" for bug in similar_bugs],
                 strategy=strategy,
                 tests=tests,
                 feedback=feedback,
-                temperature=ATTEMPT_TEMPERATURES[min(attempt, len(ATTEMPT_TEMPERATURES)) - 1],
+                temperature=temperature,
             )
             return patch, "ollama-function"
         except PatchGenerationError as error:
             function_error = str(error)
+        except Exception as error:
+            function_error = f"Function-based repair failed: {error}"
 
+    # The repository-level generator is retained for Python and other supported
+    # languages, but skip it for Java because some versions route through the
+    # same Python-only function parser.
     fault_error = ""
-    if repo_path:
+    if language != "java" and repo_path:
         try:
             from src.agents.coding_agent import generate_patch_from_repository  # noqa: PLC0415
 
@@ -341,12 +378,15 @@ def generate_patch(
                 strategy=strategy,
                 tools=tools,
                 tests=tests,
-                top_k=max(3, min(8, len(relevant_chunks or []) or 4)),
+                top_k=max(3, min(8, len(chunks) or 4)),
             )
             return patch, "ollama-fault-localization"
-        except (ImportError, PatchGenerationError, Exception) as error:
+        except Exception as error:
             fault_error = str(error)
 
+    # Generic diff generation is the final fallback. It can be used for Java as
+    # well, unlike generate_function_patch, provided the configured model can
+    # generate a unified diff for the supplied Java code.
     try:
         patch = run_codegen(
             issue=f"{issue}\n\nPREVIOUS ATTEMPT:\n{feedback}" if feedback else issue,
@@ -356,13 +396,125 @@ def generate_patch(
             tools=tools,
             tests=tests,
         )
-    except PatchGenerationError as error:
-        combined = [part for part in (function_error, fault_error, str(error)) if part]
-        if combined:
-            raise AdapterError("; ".join(combined)) from error
-        raise AdapterError(str(error)) from error
+    except Exception as error:
+        combined = [part for part in (remote_error, function_error, fault_error, str(error)) if part]
+        raise AdapterError("; ".join(combined) if combined else str(error)) from error
 
     return patch, "ollama"
+
+
+def remote_patch(repo_path: str, chunks: list[dict[str, Any]], temperature: float = 0.0) -> str:
+    """Repair the top-ranked Python/Java function with the remote model; return the diff.
+
+    The function's body is commented out in place with `<FILL_ME>` after it: the
+    IR4 input both adapters were trained on (the endpoint's CodeLlama tokenizer
+    turns `<FILL_ME>` into an infilling prompt). The reply is OR2 -- the lines
+    that replace that body -- and the diff is computed locally.
+    """
+    from src.agents.coding_agent.code_generator import MAX_PATCH_TOKENS, PatchGenerationError  # noqa: PLC0415
+    from src.agents.coding_agent.function_patch import make_diff  # noqa: PLC0415
+
+    target = next(
+        (
+            chunk
+            for chunk in chunks
+            if chunk.get("language") in ("python", "java")
+            and chunk.get("type") in ("function", "method")
+            and chunk["end_line"] > chunk["start_line"] + (chunk["language"] == "java")
+            and not _is_test_file(chunk["file"])
+        ),
+        None,
+    )
+    if target is None:
+        raise PatchGenerationError("No Python or Java function was retrieved for the remote model.")
+
+    language, file_path = target["language"], target["file"]
+    try:
+        original = (Path(repo_path) / file_path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise PatchGenerationError(f"Cannot read {file_path}: {error}") from error
+    lines = original.splitlines()
+    # ponytail: the whole body is the IR4 region; fault_localization.score_lines could narrow it.
+    # 0-based [start, end): the line after the signature up to the end (a Java method keeps its "}").
+    head, start, end = target["start_line"] - 1, target["start_line"], target["end_line"] - (language == "java")
+    prompt = _ir4(lines, head, start, end, target["end_line"], file_path, language)
+
+    payload = {"language": language, "prompt": prompt, "max_new_tokens": min(MAX_PATCH_TOKENS, 2048),
+               "temperature": temperature}
+    request = urllib.request.Request(
+        f"{REPAIR_MODEL_URL}/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"},
+    )
+    try:
+        print(
+            f"POST {REPAIR_MODEL_URL}/generate: language={language}, {target['name']} in {file_path}, "
+            f"prompt {len(prompt)} chars, max_new_tokens={payload['max_new_tokens']}, "
+            f"temperature={temperature}; waiting for the reply...",
+            flush=True,
+        )
+        started = time.monotonic()
+        with urllib.request.urlopen(request, timeout=REMOTE_TIMEOUT_SECONDS) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+        if isinstance(response_data, str):
+            reply = response_data
+        elif isinstance(response_data, dict):
+            # Support common generation-server response schemas. The current
+            # Colab endpoint is expected to return {"response": "..."}.
+            reply = next(
+                (response_data[key] for key in ("response", "generated_text", "text", "output")
+                 if isinstance(response_data.get(key), str)),
+                None,
+            )
+            if reply is None:
+                raise ValueError(
+                    "Model API JSON must contain a string field named response, generated_text, text, or output; "
+                    f"received keys: {list(response_data.keys())}"
+                )
+        else:
+            raise ValueError(f"Unexpected model API response type: {type(response_data).__name__}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:300]
+        raise PatchGenerationError(f"Remote model returned HTTP {error.code}: {detail}") from error
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as error:
+        raise PatchGenerationError(f"Remote model at {REPAIR_MODEL_URL} failed: {error}") from error
+    print(f"Remote model replied in {time.monotonic() - started:.0f}s: {reply[:300]!r}", flush=True)
+
+    fixed = reply.strip("\n").rstrip().splitlines()
+    if not fixed:
+        raise PatchGenerationError(
+            "The remote model returned an empty repair: it ended generation at once, which suggests "
+            "the IR4 prompt does not match the format the adapter was trained on."
+        )
+    # The endpoint's tokenizer.decode strips one leading space off the reply.
+    expected = next((len(line) - len(line.lstrip()) for line in lines[start:end] if line.strip()), 0)
+    if len(fixed[0]) - len(fixed[0].lstrip()) == expected - 1:
+        fixed[0] = " " + fixed[0]
+
+    repaired = "\n".join(lines[:start] + fixed + lines[end:]) + ("\n" if original.endswith("\n") else "")
+    if repaired == original:
+        raise PatchGenerationError("The remote model returned the function unchanged.")
+    if language == "python":
+        try:
+            compile(repaired, file_path, "exec")
+        except SyntaxError as error:
+            raise PatchGenerationError(
+                f"The repaired {file_path} is not valid Python: {error.msg} (line {error.lineno})."
+            ) from error
+    return make_diff(file_path, original, repaired)
+
+
+def _ir4(lines: list[str], head: int, start: int, end: int, stop: int, file_path: str, language: str) -> str:
+    """lines[start:end] commented out and followed by `<FILL_ME>`, in each adapter's training format."""
+    if language == "java":  # the repairllama package's renderer, as the Java adapter was trained
+        if (package := str(PROJECT_ROOT / "src" / "repairLlama" / "src")) not in sys.path:
+            sys.path.append(package)
+        from repairllama.representation.ir4 import describe_region, render_ir4  # noqa: PLC0415
+
+        return render_ir4(lines, describe_region(lines, start + 1, end, file_path=file_path))
+    # preprocessor/pythonprocessor.py's make_ir4, scoped to the function as in its dataset.
+    commented = [f"# {line}" if line else "#" for line in lines[start:end]]
+    return "\n".join([*lines[head:start], "# BUGGY CODE", *commented, "<FILL_ME>", *lines[end:stop]])
 
 
 def _load_stub_patch(stub_patch_path: str) -> str:
@@ -552,6 +704,56 @@ def is_better_attempt(candidate: dict[str, Any], current: dict[str, Any] | None)
     return is_better(candidate, current)
 
 
+# --------------------------------------------------------------------------
+# Commit and push (after a reviewer approves)
+# --------------------------------------------------------------------------
+
+
+def commit_and_push(repo_path: str, patch: str, issue: str = "") -> dict[str, str]:
+    """Commit `patch` on a new branch and push that branch to the clone's origin.
+
+    The commit is made in a temporary worktree, so the clone (reused by later
+    runs) stays on its own branch with a clean tree. GITHUB_TOKEN authenticates
+    an https origin and is never written to the repository's config.
+    """
+    from orchestrator.github_issues import load_token  # noqa: PLC0415
+
+    # A directory nested in another repository (the bundled sample_repo) would
+    # otherwise commit to, and push, the enclosing project.
+    if Path(_git(repo_path, "rev-parse", "--show-toplevel")).resolve() != Path(repo_path).resolve():
+        raise AdapterError(f"{repo_path} is not the root of its own git repository; nothing to push.")
+    token = load_token()
+    remote = _git(repo_path, "remote", "get-url", "origin")
+    push_url = (
+        remote.replace("https://", f"https://x-access-token:{token}@", 1)
+        if token and remote.startswith("https://")
+        else remote
+    )
+    branch = f"agent-swe/fix-{time.strftime('%Y%m%d-%H%M%S')}"
+    title = (issue.strip().splitlines() or ["repair"])[0][:72]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        worktree = str(Path(tmp) / "worktree")
+        _git(repo_path, "worktree", "add", "-b", branch, worktree, "HEAD")
+        try:
+            _git(worktree, "apply", "--whitespace=nowarn", stdin=patch)
+            _git(worktree, "add", "-A")
+            _git(worktree, "commit", "-m", f"Fix: {title}\n\nGenerated by Agent-SWE, approved by a reviewer.")
+            commit = _git(worktree, "rev-parse", "HEAD")
+            _git(worktree, "push", push_url, f"HEAD:refs/heads/{branch}", secret=token)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", worktree], cwd=repo_path, capture_output=True)
+    return {"branch": branch, "commit": commit, "remote": remote}
+
+
+def _git(cwd: str, *args: str, stdin: str | None = None, secret: str = "") -> str:
+    result = subprocess.run(["git", *args], cwd=cwd, input=stdin, capture_output=True, text=True)
+    if result.returncode:
+        message = (result.stderr or result.stdout).strip()
+        raise AdapterError(f"git {args[0]} failed: {message.replace(secret, '***') if secret else message}")
+    return result.stdout.strip()
+
+
 def _repository_language(repo_path: str, results: list[dict[str, Any]]) -> str:
     """The language the repair targets, which also picks the test runner.
 
@@ -577,7 +779,9 @@ def _repository_language(repo_path: str, results: list[dict[str, Any]]) -> str:
 
 def _is_test_file(file_path: str) -> bool:
     name = Path(file_path).name
-    return name.startswith("test_") or name.endswith(("_test.py", ".test.js", ".spec.js", ".test.ts", ".spec.ts"))
+    return name.startswith("test_") or name.endswith(
+        ("_test.py", "Test.java", ".test.js", ".spec.js", ".test.ts", ".spec.ts")
+    )
 
 
 def _unique(items: list[str]) -> list[str]:

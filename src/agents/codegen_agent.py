@@ -94,6 +94,7 @@ def call_ollama(
             "prompt": prompt,
             "system": system,
             "stream": False,
+            "keep_alive": "30m",  # one run makes many calls; reloading the model costs seconds each time
             "options": {"temperature": temperature, "num_predict": num_predict},
         }
     ).encode("utf-8")

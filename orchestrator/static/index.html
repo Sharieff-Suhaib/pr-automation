@@ -118,6 +118,9 @@
     flex-wrap: wrap;
   }
   .banner .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .banner .dot.pulse { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) { .banner .dot.pulse { animation: none; } }
   .banner strong { font-size: 15px; }
   .banner span.detail { color: var(--muted); font-size: 14px; }
   .is-pass .dot { background: var(--pass); }
@@ -168,6 +171,12 @@
   tr:last-child td { border-bottom: 0; }
   td.agent { font-family: var(--mono); font-size: 12.5px; color: var(--accent); width: 190px; white-space: nowrap; }
 
+  .review { border-color: #b9cdf5; background: #f5f8fe; }
+  .review p { margin: 0 0 14px; }
+  .review .actions { margin-top: 0; }
+  button.deny { background: #fff; color: var(--fail); border: 1px solid #f0c7c7; }
+  button.deny:hover { background: #fdf6f6; }
+
   .errors { border-color: #f0c7c7; background: #fdf6f6; }
   .errors h2 { color: var(--fail); }
   .errors li { color: #8f2323; }
@@ -178,7 +187,7 @@
 
   <header>
     <h1>Agent-SWE Orchestrator</h1>
-    <p>Repository &rarr; Recommendation &rarr; Code Generation &rarr; Testing, in one LangGraph run.</p>
+    <p>Repository &rarr; Recommendation &rarr; Code Generation &rarr; Testing &rarr; your review &rarr; push, in one LangGraph run.</p>
   </header>
 
   <form class="card" id="form">
@@ -337,18 +346,18 @@ $("form").addEventListener("submit", async (event) => {
   };
 
   $("run").disabled = true;
-  $("note").textContent = "Running... indexing and testing can take a minute.";
+  $("note").textContent = "Starting...";
   $("results").innerHTML = "";
 
   try {
-    const response = await fetch("/solve", {
+    const response = await fetch("/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Request failed (" + response.status + ")");
-    render(data);
+    await follow(data.thread_id);
   } catch (error) {
     $("results").innerHTML =
       '<div class="card errors"><h2>Request failed</h2><p>' + esc(error.message) + "</p></div>";
@@ -357,6 +366,44 @@ $("form").addEventListener("submit", async (event) => {
     $("note").textContent = "";
   }
 });
+
+// The run happens on the server in the background; poll it and show each agent
+// as it finishes, so a long model call reads as progress rather than a hang.
+async function follow(threadId) {
+  const started = Date.now();
+  let failures = 0;
+  for (;;) {
+    let report;
+    try {
+      const response = await fetch("/runs/" + threadId);
+      report = await response.json();
+      if (!response.ok) throw new Error(report.detail || "Request failed (" + response.status + ")");
+      failures = 0;
+    } catch (error) {
+      if (++failures >= 5) throw error;  // the server went away; a single blip is retried
+      await new Promise((done) => setTimeout(done, 2000));
+      continue;
+    }
+    if (!report.running) return render(report);
+    renderProgress(report, Math.round((Date.now() - started) / 1000));
+    await new Promise((done) => setTimeout(done, 2000));
+  }
+}
+
+function renderProgress(report, seconds) {
+  const step = (report.current || []).join(", ").replace(/_/g, " ") || "starting";
+  const clock = Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+  $("note").textContent = "Running for " + clock;
+  $("results").innerHTML =
+    '<div class="banner is-skip"><span class="dot pulse"></span><strong>RUNNING</strong>' +
+      '<span class="detail">now: ' + esc(step) + " &middot; " + clock +
+      " &middot; model calls can take a minute or two each</span></div>" +
+    '<div class="card"><h2>Progress</h2><table>' +
+    ((report.trace || []).map((entry) =>
+      '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"
+    ).join("") || '<tr><td class="empty">no agent has finished yet</td></tr>') +
+    "</table></div>";
+}
 
 // "PASS (4 passed, 0 failed)" for one run of the suite.
 function runSummary(result) {
@@ -383,6 +430,8 @@ function render(report) {
         " &middot; patch source: " + esc(report.patch_source) +
       "</span>" +
     "</div>";
+
+  html += reviewCard(report);
 
   if (report.errors && report.errors.length) {
     html += '<div class="card errors"><h2>Errors</h2>' + bullets(report.errors) + "</div>";
@@ -495,6 +544,68 @@ function render(report) {
     "</table></div>";
 
   $("results").innerHTML = html;
+
+  const thread = (report.review || {}).thread_id;
+  document.querySelectorAll("[data-approve]").forEach((button) =>
+    button.addEventListener("click", () => decide(thread, button.dataset.approve === "true")));
+}
+
+// The run pauses before anything is pushed: the reviewer approves (commit on a
+// new branch and push it) or denies (the run ends). Both reload the report.
+function reviewCard(report) {
+  const review = report.review || {};
+  const push = report.push || {};
+
+  if (review.pending) {
+    return '<div class="card review"><h2>Your review</h2>' +
+      "<p>Read the patch, test verdict and reflection below. Approving commits the patch on a new branch " +
+      "and pushes it to the repository's origin; denying ends the run without pushing.</p>" +
+      '<div class="actions">' +
+        '<button type="button" data-approve="true">Approve &amp; push</button>' +
+        '<button type="button" class="deny" data-approve="false">Deny</button>' +
+        '<span class="note" id="review_note"></span>' +
+      "</div></div>";
+  }
+  if (push.branch) {
+    const github = /^https:\/\/github\.com\//.test(push.remote || "");
+    const where = github
+      ? '<a href="' + esc(push.remote.replace(/\.git$/, "")) + "/tree/" + esc(push.branch) +
+        '" target="_blank" rel="noopener">' + esc(push.branch) + "</a>"
+      : '<span class="mono">' + esc(push.branch) + "</span> on " + esc(push.remote);
+    return '<div class="banner is-pass"><span class="dot"></span><strong>APPROVED &amp; PUSHED</strong>' +
+      '<span class="detail">' + where + ' &middot; commit <span class="mono">' +
+      esc((push.commit || "").slice(0, 7)) + "</span></span></div>";
+  }
+  if (review.approved) {
+    return '<div class="banner is-fail"><span class="dot"></span><strong>APPROVED, PUSH FAILED</strong>' +
+      '<span class="detail">see the errors below</span></div>';
+  }
+  if (review.approved === false) {
+    return '<div class="banner is-skip"><span class="dot"></span><strong>' +
+      (review.reason ? "NOT REVIEWED" : "DENIED") + "</strong>" +
+      '<span class="detail">' + esc(review.reason || "workflow terminated; nothing was pushed") + "</span></div>";
+  }
+  return "";
+}
+
+async function decide(threadId, approve) {
+  document.querySelectorAll("[data-approve]").forEach((button) => (button.disabled = true));
+  $("review_note").textContent = approve ? "Committing and pushing..." : "Ending the run...";
+
+  try {
+    const response = await fetch("/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, approve: approve }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Request failed (" + response.status + ")");
+    render(data);
+  } catch (error) {
+    $("review_note").className = "note warn";
+    $("review_note").textContent = error.message;
+    document.querySelectorAll("[data-approve]").forEach((button) => (button.disabled = false));
+  }
 }
 
 // Colour a unified diff: file headers, hunk headers, additions, removals.

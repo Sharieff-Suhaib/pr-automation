@@ -122,7 +122,7 @@ goes from 2 failing tests to 4 passing ones (2 fixed, 0 broken).
 **Real run** — clones the repository and generates the patch with the model:
 
 ```bash
-python -m orchestrator.run_demo --repo-url https://github.com/Sharieff-Suhaib/dummy_repo.git --issue "Login fails when the username is empty"
+python -m orchestrator.run_demo --repo-urlh https://github.com/Sharieff-Suhaib/dummy_repo.git --issue "Login fails when the username is empty"
 ```
 
 **Call the API directly** — with the server running:

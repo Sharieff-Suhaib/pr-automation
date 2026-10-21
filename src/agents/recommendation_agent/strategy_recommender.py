@@ -90,7 +90,8 @@ def recommend(
     """Recommend a bug type + repair strategy for the issue."""
     prompt = build_prompt(issue_text, code, similar_bugs or [])
     try:
-        raw = call_ollama(prompt, model=model, system=SYSTEM_PROMPT)
+        # A two-sentence JSON answer; the cap stops a rambling reply early.
+        raw = call_ollama(prompt, model=model, system=SYSTEM_PROMPT, num_predict=200)
     except OllamaError:
         return _fallback(issue_text)
 

@@ -55,7 +55,7 @@ class AgentState(TypedDict, total=False):
 
     # --- Coding Agent (Member 3) ---
     patch: str
-    patch_source: str  # "ollama-function" | "ollama" (model wrote the diff) | "stub" | "none"
+    patch_source: str  # "remote-ir4" | "ollama-function" | "ollama" (model wrote the diff) | "stub" | "none"
 
     # --- Testing Agent ---
     working_repo: str
@@ -78,6 +78,10 @@ class AgentState(TypedDict, total=False):
     # Analysis of the latest failed attempt; its feedback is prepended to `test_feedback`.
     reflection: dict[str, Any]
     reflections: Annotated[list[dict[str, Any]], operator.add]  # one per failed attempt
+
+    # --- Human review and push ---
+    review: dict[str, Any]  # {"approved": bool}; approved runs go on to commit_and_push
+    push: dict[str, Any]  # {"branch", "commit", "remote"} once the approved patch is pushed
 
     # --- Control / configuration ---
     top_k: int

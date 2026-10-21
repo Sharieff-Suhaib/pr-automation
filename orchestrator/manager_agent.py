@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any
+import sys
+import threading
+import uuid
+from typing import Any, Callable
+
+from langgraph.types import Command
 
 from orchestrator.graph import get_graph
 from orchestrator.state import DEFAULT_MAX_ATTEMPTS, AgentState, new_state
@@ -39,9 +44,23 @@ class ManagerAgent:
         self.isolated_env = isolated_env
         self.graph = get_graph()
 
-    def solve(self, repo_url: str, issue: str) -> dict[str, Any]:
-        """Run the full workflow for one issue and return the report."""
-        initial = new_state(
+    def solve(self, repo_url: str, issue: str, reviewer: Reviewer | None = None) -> dict[str, Any]:
+        """Run the full workflow for one issue and return the report.
+
+        `reviewer` gets the review request (patch, status, verdict, root cause)
+        and returns True to commit and push. Without one, a run that reaches the
+        review is left paused: the report's `review` holds the `thread_id` that
+        `resume_review` continues.
+        """
+        print(f"Solving issue {issue} in {repo_url}...")
+        thread_id = uuid.uuid4().hex
+        final = self.graph.invoke(self.initial_state(repo_url, issue), _config(thread_id))
+        if final.get("__interrupt__") and reviewer:
+            final = self.graph.invoke(Command(resume=reviewer(final["__interrupt__"][0].value)), _config(thread_id))
+        return _report(final, thread_id)
+
+    def initial_state(self, repo_url: str, issue: str) -> AgentState:
+        return new_state(
             issue=issue,
             repo_url=repo_url,
             top_k=self.top_k,
@@ -52,8 +71,70 @@ class ManagerAgent:
             max_attempts=self.max_attempts,
             isolated_env=self.isolated_env,
         )
-        final: AgentState = self.graph.invoke(initial)
-        return build_report(final)
+
+
+Reviewer = Callable[[dict[str, Any]], bool]
+
+# Background runs started by the UI: thread_id -> {"done": bool, "error": str}.
+_runs: dict[str, dict[str, Any]] = {}
+
+
+def start_run(repo_url: str, issue: str, **options: Any) -> str:
+    """Start a run in a background thread and return its thread_id; poll it with `run_status`.
+
+    The HTTP request returns at once, so a run of many minutes never holds a
+    browser request open, and the checkpointer exposes its progress meanwhile.
+    """
+    manager = ManagerAgent(**options)
+    thread_id = uuid.uuid4().hex
+    _runs[thread_id] = {"done": False, "error": ""}
+
+    def work() -> None:
+        try:
+            manager.graph.invoke(manager.initial_state(repo_url, issue), _config(thread_id))
+        except Exception as error:  # a crash must end the run visibly, not leave it "running"
+            _runs[thread_id]["error"] = f"{type(error).__name__}: {error}"
+        finally:
+            _runs[thread_id]["done"] = True
+
+    threading.Thread(target=work, daemon=True, name=f"run-{thread_id[:8]}").start()
+    return thread_id
+
+
+def run_status(thread_id: str) -> dict[str, Any]:
+    """The report so far: `running` and `current` (the agent at work) until the run ends."""
+    run = _runs[thread_id]  # KeyError for an unknown run
+    snapshot = get_graph().get_state(_config(thread_id))
+    report = build_report(snapshot.values)
+    report["running"] = not run["done"]
+    if report["running"]:
+        report["status"] = "running"
+        report["current"] = list(snapshot.next)
+    elif "human_review" in snapshot.next:
+        report["review"] = {"pending": True, "thread_id": thread_id}
+    if run["error"]:
+        report["status"] = "failed"
+        report["errors"] = [*report["errors"], f"workflow crashed: {run['error']}"]
+    return report
+
+
+def resume_review(thread_id: str, approved: bool) -> dict[str, Any]:
+    """Approve or deny a run paused at `human_review`; raises KeyError for an unknown one."""
+    graph = get_graph()
+    if "human_review" not in graph.get_state(_config(thread_id)).next:
+        raise KeyError(thread_id)
+    return _report(graph.invoke(Command(resume=approved), _config(thread_id)), thread_id)
+
+
+def _config(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def _report(final: AgentState, thread_id: str) -> dict[str, Any]:
+    report = build_report(final)
+    if final.get("__interrupt__"):
+        report["review"] = {"pending": True, "thread_id": thread_id}
+    return report
 
 
 def build_report(state: AgentState) -> dict[str, Any]:
@@ -105,6 +186,9 @@ def build_report(state: AgentState) -> dict[str, Any]:
         # The Reflection Agent's analysis of the last failed attempt, and of every one.
         "reflection": state.get("reflection") or {},
         "reflections": state.get("reflections", []),
+        # The reviewer's decision, and the pushed branch once an approved patch is pushed.
+        "review": state.get("review") or {},
+        "push": state.get("push") or {},
         "errors": state.get("errors", []),
         "trace": state.get("trace", []),
     }
@@ -120,6 +204,7 @@ def solve_issue(
     stub_repro_path: str = "",
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     isolated_env: bool = True,
+    reviewer: Reviewer | None = None,
 ) -> dict[str, Any]:
     """One-call convenience wrapper around `ManagerAgent.solve`."""
     manager = ManagerAgent(
@@ -131,7 +216,16 @@ def solve_issue(
         max_attempts=max_attempts,
         isolated_env=isolated_env,
     )
-    return manager.solve(repo_url, issue)
+    return manager.solve(repo_url, issue, reviewer=reviewer)
+
+
+def ask_in_terminal(review: dict[str, Any]) -> bool:
+    """The CLI's reviewer: show the patch on stderr (stdout carries the JSON report) and ask."""
+    print(f"\n{review['patch']}\nStatus: {review['status']} -- {review['verdict']}", file=sys.stderr)
+    if review["root_cause"]:
+        print(f"Reflection: {review['root_cause']}", file=sys.stderr)
+    print("Commit and push this patch? [y/N] ", end="", file=sys.stderr, flush=True)
+    return input().strip().lower() in ("y", "yes")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -172,6 +266,7 @@ def main() -> int:
         stub_repro_path=args.stub_repro,
         max_attempts=args.max_attempts,
         isolated_env=not args.no_isolated_env,
+        reviewer=ask_in_terminal,
     )
     print(json.dumps(report, indent=2))
     return 0 if report["status"] == "solved" else 1

@@ -25,9 +25,13 @@
       |        +--> coding_agent  attempts left: retry with the reflection + test feedback
       |        |
       |        v
-      |       END                 max_attempts reached
+      |     human_review          max_attempts reached
+      v        ^
+    human_review                  solved: pause for a person to approve or deny the patch
+      |
+      +--> commit_and_push -> END approved: commit on a new branch, push it
       v
-    END                           solved
+     END                          denied: nothing is pushed
 
 Each node is a function `AgentState -> partial AgentState`. Nodes never raise:
 a failing agent records its message in `errors` and returns empty results, so a
@@ -36,7 +40,11 @@ missing dependency (no network, no Ollama) degrades the run instead of ending it
 
 from __future__ import annotations
 
+import time
+
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from orchestrator import adapters
 from orchestrator.adapters import AdapterError
@@ -340,7 +348,12 @@ def _record_attempt(state: AgentState, outcome: dict, baseline: dict) -> AgentSt
     if adapters.is_better_attempt(current, best):
         best = current
 
-    finished = current["status"] == "solved" or not _can_retry(state, number)
+    # An applied patch with no test that ran cannot be judged, so another attempt
+    # could not be judged either: hand this one to the reviewer instead.
+    untested = current["patch_status"] == "APPLIED" and not (
+        current["test_result"].get("passed") or current["test_result"].get("failed")
+    )
+    finished = current["status"] == "solved" or untested or not _can_retry(state, number)
     shown = best if finished else current
     earlier_patches = [row.get("patch", "") for row in state.get("attempts", [])]
     feedback = "" if current["status"] == "solved" else adapters.attempt_feedback(current, earlier_patches)
@@ -419,7 +432,9 @@ def reflection_agent(state: AgentState) -> AgentState:
             strategy=state.get("strategy", ""),
             previous_attempts=state.get("attempts", []),
             max_attempts=state.get("max_attempts", 3),
-            use_llm=state.get("codegen_backend", "ollama") != "stub",
+            # The LLM's guidance is only read by a retry; after the last attempt the
+            # instant rule-based analysis explains the failure in the report.
+            use_llm=state.get("codegen_backend", "ollama") != "stub" and state.get("status") == "running",
         )
     except AdapterError as error:
         # Without a reflection the retry still has the testing agent's feedback.
@@ -449,17 +464,59 @@ def reflection_agent(state: AgentState) -> AgentState:
     return update
 
 
+def human_review(state: AgentState) -> AgentState:
+    """Pause until a person approves or denies the final patch.
+
+    Runs once, after the retry loop has ended. The run is resumed with
+    `Command(resume=True)` to approve; any other value denies and ends it.
+    A patch that does not apply cannot be pushed, so it is not put to review.
+    """
+    patch = state.get("patch", "")
+    if not patch.strip() or state.get("patch_status") != "APPLIED":
+        return AgentState(
+            review={"approved": False, "reason": "no patch that applies"},
+            trace=[trace_entry("human_review", "skipped: no patch that applies")],
+        )
+
+    approved = interrupt(
+        {
+            "status": state.get("status", ""),
+            "patch": patch,
+            "verdict": (state.get("test_verdict") or {}).get("reason", ""),
+            "root_cause": (state.get("reflection") or {}).get("root_cause", ""),
+        }
+    ) is True
+    summary = "approved" if approved else "denied; workflow terminated, nothing pushed"
+    return AgentState(review={"approved": approved}, trace=[trace_entry("human_review", summary)])
+
+
+def commit_and_push(state: AgentState) -> AgentState:
+    """Commit the approved patch on a new branch and push it."""
+    try:
+        pushed = adapters.commit_and_push(state.get("repo_path", ""), state.get("patch", ""), state.get("issue", ""))
+    except AdapterError as error:
+        return AgentState(
+            errors=[f"commit_and_push: {error}"],
+            trace=[trace_entry("commit_and_push", "failed", error=str(error))],
+        )
+    return AgentState(push=pushed, trace=[trace_entry("commit_and_push", f"pushed {pushed['branch']}", **pushed)])
+
+
 def route_after_testing(state: AgentState) -> str:
-    """Solved (or nothing was tested) ends the run; any failed attempt goes to reflection."""
+    """Nothing tested ends the run; solved goes to review; any failed attempt goes to reflection."""
     attempt = state.get("last_attempt")
-    if not attempt or attempt.get("status") == "solved":
+    if not attempt:
         return END
-    return "reflection_agent"
+    return "human_review" if attempt.get("status") == "solved" else "reflection_agent"
 
 
 def route_after_reflection(state: AgentState) -> str:
-    """Retry while the testing agent left attempts open; otherwise stop (no unbounded loop)."""
-    return "coding_agent" if state.get("status") == "running" else END
+    """Retry while the testing agent left attempts open; otherwise review (no unbounded loop)."""
+    return "coding_agent" if state.get("status") == "running" else "human_review"
+
+
+def route_after_review(state: AgentState) -> str:
+    return "commit_and_push" if (state.get("review") or {}).get("approved") else END
 
 
 def _counts(result: dict) -> str:
@@ -486,28 +543,51 @@ def _not_tested(reason: str) -> dict:
     }
 
 
+def _logged(node):
+    """Print when each agent starts and ends: model calls can run for minutes with no other output."""
+
+    def run(state: AgentState) -> AgentState:
+        print(f"[{node.__name__}] started", flush=True)
+        started = time.monotonic()
+        update = node(state)
+        summary = "; ".join(entry["summary"] for entry in update.get("trace", []))
+        print(f"[{node.__name__}] done in {time.monotonic() - started:.0f}s: {summary}", flush=True)
+        return update
+
+    return run
+
+
 def build_graph():
-    """Wire the seven agents into a compiled LangGraph workflow."""
+    """Wire the agents, the review gate and the push into a compiled LangGraph workflow.
+
+    The checkpointer is what lets `human_review` pause a run and resume it later.
+    """
     builder = StateGraph(AgentState)
 
-    builder.add_node("repository_agent", repository_agent)
-    builder.add_node("recommendation_agent", recommendation_agent)
-    builder.add_node("environment_agent", environment_agent)
-    builder.add_node("reproduction_agent", reproduction_agent)
-    builder.add_node("coding_agent", coding_agent)
-    builder.add_node("testing_agent", testing_agent)
-    builder.add_node("reflection_agent", reflection_agent)
+    builder.add_node("repository_agent", _logged(repository_agent))
+    builder.add_node("recommendation_agent", _logged(recommendation_agent))
+    # builder.add_node("environment_agent", _logged(environment_agent))
+    # builder.add_node("reproduction_agent", _logged(reproduction_agent))
+    builder.add_node("coding_agent", _logged(coding_agent))
+    builder.add_node("testing_agent", _logged(testing_agent))
+    builder.add_node("reflection_agent", _logged(reflection_agent))
+    builder.add_node("human_review", _logged(human_review))
+    builder.add_node("commit_and_push", _logged(commit_and_push))
 
     builder.add_edge(START, "repository_agent")
     builder.add_edge("repository_agent", "recommendation_agent")
-    builder.add_edge("recommendation_agent", "environment_agent")
-    builder.add_edge("environment_agent", "reproduction_agent")
-    builder.add_edge("reproduction_agent", "coding_agent")
+    # builder.add_edge("recommendation_agent", "environment_agent")
+    # builder.add_edge("environment_agent", "reproduction_agent")
+    # builder.add_edge("reproduction_agent", "coding_agent")
+    builder.add_edge("recommendation_agent", "coding_agent")
     builder.add_edge("coding_agent", "testing_agent")
-    builder.add_conditional_edges("testing_agent", route_after_testing, ["reflection_agent", END])
-    builder.add_conditional_edges("reflection_agent", route_after_reflection, ["coding_agent", END])
+    builder.add_conditional_edges("testing_agent", route_after_testing, ["reflection_agent", "human_review", END])
+    builder.add_conditional_edges("reflection_agent", route_after_reflection, ["coding_agent", "human_review"])
+    builder.add_conditional_edges("human_review", route_after_review, ["commit_and_push", END])
+    builder.add_edge("commit_and_push", END)
 
-    return builder.compile()
+    # ponytail: in-memory, so a run awaiting review is lost on restart; SqliteSaver if that matters.
+    return builder.compile(checkpointer=InMemorySaver())
 
 
 _compiled_graph = None

@@ -74,7 +74,8 @@ def recommend(issue_text: str, code: str = "", model: str = DEFAULT_MODEL) -> li
     """Recommend tests to validate a repair for this issue."""
     prompt = build_prompt(issue_text, code)
     try:
-        raw = call_ollama(prompt, model=model, system=SYSTEM_PROMPT)
+        # About ten test names, one per line, is all the repair prompt uses.
+        raw = call_ollama(prompt, model=model, system=SYSTEM_PROMPT, num_predict=160)
     except OllamaError:
         return _fallback(issue_text, code)
 

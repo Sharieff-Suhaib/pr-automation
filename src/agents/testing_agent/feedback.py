@@ -66,7 +66,8 @@ def build_feedback(
 
 
 def is_better(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
-    """Whether attempt ``candidate`` beats ``current``: verdict, then fewer broken, then more fixed.
+    """Whether attempt ``candidate`` beats ``current``: verdict, then fewer broken, then more
+    fixed, then a patch that applied.
 
     On a full tie the earlier attempt is kept.
     """
@@ -75,12 +76,15 @@ def is_better(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool
     return _score(candidate) > _score(current)
 
 
-def _score(attempt: dict[str, Any]) -> tuple[int, int, int]:
+def _score(attempt: dict[str, Any]) -> tuple[int, int, int, bool]:
     verdict = attempt.get("test_verdict") or {}
     return (
         _RANK.get(attempt.get("status", "failed"), 0),
         -len(verdict.get("pass_to_fail") or []),
         len(verdict.get("fail_to_pass") or []),
+        # With no tests to tell them apart, a patch that applies beats no patch:
+        # it is the one a reviewer can still judge.
+        attempt.get("patch_status") == "APPLIED",
     )
 
 
