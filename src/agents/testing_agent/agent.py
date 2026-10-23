@@ -23,7 +23,9 @@ from typing import Any, Mapping
 
 from src.agents.coding_agent.patch_manager import apply_patch
 from src.agents.coding_agent.tester import run_tests, select_test_command
+from src.agents.testing_agent import java
 from src.agents.testing_agent.environment import working_copy_env
+from src.agents.testing_agent.java import uses_java_sandbox
 from src.agents.testing_agent.junit import PASSED, parse_junit_report
 from src.agents.testing_agent.selection import id_prefix, related_tests
 from src.agents.testing_agent.verdict import TestVerdict, compare_runs, not_tested
@@ -47,6 +49,8 @@ def run_suite(
     The stored output is capped at its last MAX_OUTPUT_CHARS characters.
     """
     repository = Path(working_repo)
+    if uses_java_sandbox(repository, language):
+        return java.run_suite(repository, paths=paths)
     try:
         command = select_test_command(repository, language=language or None)
     except ValueError:
@@ -71,7 +75,8 @@ def run_suite(
         )
         cases, messages = parse_junit_report(report)
 
-    return _capped({**result.to_dict(), "cases": cases, "messages": messages})
+    no_tests = "pytest collected no tests." in result.errors
+    return _capped({**result.to_dict(), "cases": cases, "messages": messages, **({"no_tests": True} if no_tests else {})})
 
 
 def _capped(result: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +253,8 @@ def compile_errors(repository: Path, changed_files: list[str]) -> list[str]:
 
 
 def _uses_pytest(repository: Path, language: str) -> bool:
+    if uses_java_sandbox(repository, language):
+        return False
     try:
         command = select_test_command(repository, language=language or None)
     except ValueError:

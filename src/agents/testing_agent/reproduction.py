@@ -31,12 +31,18 @@ from src.agents.testing_agent.junit import FAILED
 
 REPRO_FILE = "test_issue_reproduction.py"
 REPRO_MODULE = "test_issue_reproduction"
+# Java: a JUnit 5 class next to the code under test (same package), run by java.py.
+JAVA_REPRO_CLASS = "AgentReproTest"
 MAX_ATTEMPTS = 2
 
 SYSTEM_PROMPT = (
-    "You are a QA engineer who writes pytest regression tests. Reply with one "
-    "complete Python test file only -- no explanations, no markdown fences."
+    "You are a QA engineer who writes regression tests. Reply with one "
+    "complete test file only -- no explanations, no markdown fences."
 )
+_JAVA_FILE_LINES = 200
+_JAVA_TYPE_RE = re.compile(r"\b(?:class|interface|enum|record)\s+(\w+)")
+_JAVA_PACKAGE_RE = re.compile(r"^\s*package\s+[\w.]+\s*;\s*$", re.M)
+_JAVAC_ERROR_RE = re.compile(r"([\w$]+\.java):(\d+): error")
 
 # A failure whose message starts with one of these means the test itself is
 # broken, not that it found the bug.
@@ -92,20 +98,34 @@ def prepare_reproduction(
     def plain_baseline() -> dict[str, Any]:
         return run_baseline(repository, workspace_root, language=language, python=python)
 
-    if language and language.lower() != "python":
-        reproduction["reason"] = f"Reproduction tests are only written for Python, not {language}."
+    lang = (language or "python").lower()
+    if lang not in ("python", "java"):
+        reproduction["reason"] = f"Reproduction tests are only written for Python and Java, not {language}."
         return reproduction, plain_baseline()
 
-    chunks = [chunk for chunk in relevant_code if str(chunk.get("file", "")).endswith(".py")]
-    chunks = [chunk for chunk in chunks if not _is_test_file(chunk["file"])][:_MAX_CHUNKS]
+    suffix = ".py" if lang == "python" else ".java"
+    chunks = [chunk for chunk in relevant_code if str(chunk.get("file", "")).endswith(suffix)]
+    chunks = [chunk for chunk in chunks if not _is_test_file(chunk["file"])]
+    if lang == "java":  # one class under test: the file the coding agent repairs
+        chunks = [chunk for chunk in chunks if chunk["file"] == chunks[0]["file"]] if chunks else []
+    chunks = chunks[:_MAX_CHUNKS]
     if not chunks:
-        reproduction["reason"] = "No Python source code was found to write a test against."
+        reproduction["reason"] = f"No {lang.title()} source code was found to write a test against."
         return reproduction, plain_baseline()
+
+    if lang == "java":
+        target = chunks[0]["file"]
+        target_source = (repository / target).read_text(encoding="utf-8", errors="replace")
+        reproduction["path"] = str(PurePosixPath(target).parent / f"{JAVA_REPRO_CLASS}.java")
+    path = reproduction["path"]
 
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         reproduction["attempts"] = attempt
-        prompt = build_prompt(issue, chunks, example_test(repository, chunks), feedback)
+        if lang == "java":
+            prompt = build_java_prompt(issue, target, target_source, feedback)
+        else:
+            prompt = build_prompt(issue, chunks, example_test(repository, chunks), feedback)
 
         try:
             raw = write(prompt)
@@ -114,23 +134,34 @@ def prepare_reproduction(
             return reproduction, plain_baseline()
 
         try:
-            source = clean_test_source(raw, chunks, repository)
+            if lang == "java":
+                source = clean_java_test(raw, target_source)
+            else:
+                source = clean_test_source(raw, chunks, repository)
         except ValueError as error:
             reproduction.update(status="rejected", reason=str(error), source=raw.strip())
             feedback = _feedback(str(error), raw)
             continue
 
         baseline = run_baseline(
-            repository, workspace_root, language=language, extra_files={REPRO_FILE: source}, python=python
+            repository, workspace_root, language=language, extra_files={path: source}, python=python
         )
         accepted, reason, tests = classify(baseline)
+        if not accepted and lang == "java" and (salvaged := drop_broken_java_tests(source, baseline)):
+            # Some test methods call things that do not exist; the rest may still reproduce.
+            source = salvaged
+            baseline = run_baseline(
+                repository, workspace_root, language=language, extra_files={path: source}, python=python
+            )
+            accepted, reason, tests = classify(baseline)
 
-        pruned = prune_tests(source, keep=tests) if accepted else source
+        # ponytail: Java tests are not pruned (no AST edit); a passing one stays and passes after too.
+        pruned = prune_tests(source, keep=tests) if accepted and lang == "python" else source
         if pruned != source:
             # Rerun so the baseline holds exactly the tests the patched run will see.
             source = pruned
             baseline = run_baseline(
-                repository, workspace_root, language=language, extra_files={REPRO_FILE: source}, python=python
+                repository, workspace_root, language=language, extra_files={path: source}, python=python
             )
             accepted, reason, tests = classify(baseline)
         reproduction.update(
@@ -157,7 +188,9 @@ def classify(baseline: dict[str, Any]) -> tuple[bool, str, list[str]]:
     outcomes = _repro_only(baseline.get("cases", {}))
     messages = _repro_only(baseline.get("messages", {}))
     if not outcomes:
-        return False, "pytest collected no test from the file.", []
+        errors = baseline.get("errors") or []
+        detail = f" {errors[0]}" if errors and "collected no tests" not in errors[0] else ""
+        return False, f"No test from the file ran.{detail}".strip(), []
 
     reproducing = [
         test_id
@@ -233,6 +266,105 @@ def build_prompt(
     if feedback:
         parts += ["", feedback]
     return "\n".join(parts)
+
+
+def build_java_prompt(issue: str, target: str, target_source: str, feedback: str = "") -> str:
+    """The brief for a JUnit 5 reproduction test of the class in ``target``."""
+    lines = target_source.splitlines()
+    shown = "\n".join(lines[:_JAVA_FILE_LINES]) + ("\n// ... (rest of the file omitted)" if len(lines) > _JAVA_FILE_LINES else "")
+    parts = [
+        "### ISSUE", issue.strip(), "",
+        f"### CODE UNDER TEST: {target}", shown, "",
+        "### TASK",
+        f"Write a JUnit 5 test class named {JAVA_REPRO_CLASS} that reproduces the issue.",
+        "Rules:",
+        f"- Declare `public class {JAVA_REPRO_CLASS}` with 1 or 2 methods annotated @Test, each named testIssue<WhatItChecks>.",
+        "- Each test checks ONE concrete symptom the issue describes, with the expected result the issue states.",
+        "  Do not assert anything the issue does not say (no guessed exceptions, orders or messages).",
+        "- Each test must FAIL on the code above, because of the bug, and PASS once the bug is fixed.",
+        "- Assert the correct behaviour the issue asks for, never the current buggy behaviour.",
+        "- Use the classes above as they are, through their constructors and methods. Do not copy or redefine them.",
+        "  They are in the same package as the test, so they need no import.",
+        "- Use only JUnit 5 (org.junit.jupiter.api) and the Java standard library; import every java.util class you use.",
+        "Reply with the contents of the file only.",
+    ]
+    if feedback:
+        parts += ["", feedback]
+    return "\n".join(parts)
+
+
+def clean_java_test(raw: str, target_source: str) -> str:
+    """Strip fences, reject a test that cannot work, add the JUnit imports it forgot.
+
+    The class goes in the package of the code under test, so any package line
+    the model wrote is replaced by the target's. Raises ``ValueError`` with a
+    reason the model can act on.
+    """
+    from src.agents.codegen_agent import clean_output  # noqa: PLC0415 -- only needed here
+
+    source = _JAVA_PACKAGE_RE.sub("", clean_output(raw)).strip()
+    if not re.search(rf"\bclass\s+{JAVA_REPRO_CLASS}\b", source):
+        raise ValueError(f"The file does not declare `public class {JAVA_REPRO_CLASS}`.")
+    if "@Test" not in source:
+        raise ValueError("The file has no method annotated @Test.")
+    redefined = sorted((set(_JAVA_TYPE_RE.findall(source)) - {JAVA_REPRO_CLASS}) & set(_JAVA_TYPE_RE.findall(target_source)))
+    if redefined:
+        raise ValueError(
+            f"The file redefines {', '.join(redefined)} instead of using the repository's class, "
+            "so it would test its own copy."
+        )
+
+    header = []
+    package = _JAVA_PACKAGE_RE.search(target_source)
+    if package:
+        header.append(package.group(0).strip())
+    if not re.search(r"import\s+org\.junit\.jupiter\.api\.(Test|\*)\s*;", source):
+        header.append("import org.junit.jupiter.api.Test;")
+    if "Assertions" not in source:
+        header.append("import static org.junit.jupiter.api.Assertions.*;")
+    # The model often uses List/Map without importing them; this cannot clash with its own imports.
+    if "import java.util.*;" not in source:
+        header.append("import java.util.*;")
+    return "\n".join([*header, "", source]).strip() + "\n"
+
+
+def drop_broken_java_tests(source: str, baseline: dict[str, Any]) -> str | None:
+    """The test class without the @Test methods javac rejected, or None when that cannot help.
+
+    Only when every compile error lies inside a test method of the reproduction
+    class -- an error in a field, an import or the repository itself is not
+    fixed by dropping tests -- and at least one test is left.
+    """
+    from tree_sitter_languages import get_parser  # noqa: PLC0415 -- only Java needs it
+
+    text = baseline.get("output", "") + "\n" + "\n".join(baseline.get("errors") or [])
+    errors = _JAVAC_ERROR_RE.findall(text)
+    if not errors or any(name != f"{JAVA_REPRO_CLASS}.java" for name, _ in errors):
+        return None
+    bad_lines = {int(line) for _, line in errors}
+
+    data = source.encode("utf-8")
+    tests: list[tuple[int, int]] = []  # 1-based inclusive line spans of @Test methods
+
+    def walk(node) -> None:
+        if node.type == "method_declaration":
+            modifiers = next((c for c in node.children if c.type == "modifiers"), None)
+            if modifiers is not None and b"@Test" in data[modifiers.start_byte : modifiers.end_byte]:
+                tests.append((node.start_point[0] + 1, node.end_point[0] + 1))
+            return
+        for child in node.children:
+            walk(child)
+
+    walk(get_parser("java").parse(data).root_node)
+    broken = [span for span in tests if any(span[0] <= line <= span[1] for line in bad_lines)]
+    outside = [line for line in bad_lines if not any(start <= line <= end for start, end in tests)]
+    if not broken or outside or len(broken) == len(tests):
+        return None
+
+    lines = source.splitlines(keepends=True)
+    for start, end in sorted(broken, reverse=True):  # @Test is in the span: it is a modifier
+        del lines[start - 1 : end]
+    return "".join(lines)
 
 
 def clean_test_source(raw: str, chunks: list[dict[str, Any]], repository: Path) -> str:
@@ -348,9 +480,15 @@ def _feedback(reason: str, previous: str) -> str:
 
 def _repro_only(values: dict[str, str]) -> dict[str, str]:
     """Entries that belong to the reproduction file (including its collection error)."""
-    return {test_id: value for test_id, value in values.items() if test_id.startswith(REPRO_MODULE)}
+    return {test_id: value for test_id, value in values.items() if _is_repro_id(test_id)}
+
+
+def _is_repro_id(test_id: str) -> bool:
+    """``test_issue_reproduction::test_x`` (pytest) or ``[pkg.]AgentReproTest::testX()`` (JUnit)."""
+    module = test_id.split("::")[0]
+    return module.startswith(REPRO_MODULE) or module.split(".")[-1] == JAVA_REPRO_CLASS
 
 
 def _is_test_file(file_path: str) -> bool:
     name = PurePosixPath(file_path).name
-    return name.startswith("test_") or name.endswith("_test.py")
+    return name.startswith("test_") or name.endswith(("_test.py", "Test.java"))

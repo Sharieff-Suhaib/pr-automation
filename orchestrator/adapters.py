@@ -345,7 +345,9 @@ def generate_patch(
     # Python (ast) and Java (tree-sitter): the model returns corrected functions,
     # the diff is computed locally, so it always applies.
     function_error = ""
-    if repo_path and chunks:
+    # A reply that loops on one line is aborted by Ollama ("token repeat limit"); one
+    # retry a little hotter usually gets through, far cheaper than the next mode.
+    for heat in (temperature, min(temperature + 0.3, 1.0)) if repo_path and chunks else ():
         try:
             patch = generate_function_patch(
                 issue=issue,
@@ -355,19 +357,26 @@ def generate_patch(
                 strategy=strategy,
                 tests=tests,
                 feedback=feedback,
-                temperature=temperature,
+                temperature=heat,
             )
             return patch, "ollama-function"
         except PatchGenerationError as error:
             function_error = str(error)
         except Exception as error:
             function_error = f"Function-based repair failed: {error}"
+        if "repeat limit" not in function_error:
+            break
 
-    # The repository-level generator is retained for Python and other supported
-    # languages, but skip it for Java because some versions route through the
-    # same Python-only function parser.
+    if language == "java":
+        # The diff mode never produced a usable Java patch in testing: codellama:7b
+        # repeats hunks until the 1024-token cap (60-250 s per call). Fail fast so
+        # the retry loop tries again instead.
+        combined = [part for part in (remote_error, function_error) if part]
+        raise AdapterError("; ".join(combined) or "No Java function could be repaired.")
+
+    # The repository-level generator, for Python and the other languages.
     fault_error = ""
-    if language != "java" and repo_path:
+    if repo_path:
         try:
             from src.agents.coding_agent import generate_patch_from_repository  # noqa: PLC0415
 
@@ -384,9 +393,7 @@ def generate_patch(
         except Exception as error:
             fault_error = str(error)
 
-    # Generic diff generation is the final fallback. It can be used for Java as
-    # well, unlike generate_function_patch, provided the configured model can
-    # generate a unified diff for the supplied Java code.
+    # Generic diff generation is the final fallback.
     try:
         patch = run_codegen(
             issue=f"{issue}\n\nPREVIOUS ATTEMPT:\n{feedback}" if feedback else issue,
@@ -782,6 +789,9 @@ def _is_test_file(file_path: str) -> bool:
     return name.startswith("test_") or name.endswith(
         ("_test.py", "Test.java", ".test.js", ".spec.js", ".test.ts", ".spec.ts")
     )
+
+
+is_test_file = _is_test_file  # for graph.py
 
 
 def _unique(items: list[str]) -> list[str]:

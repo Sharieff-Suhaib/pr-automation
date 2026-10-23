@@ -149,6 +149,13 @@ def compare_runs(
 
 def _compare_overall(baseline: dict[str, Any], patched: dict[str, Any]) -> TestVerdict:
     """Fallback for runners without per-test results: compare PASS/FAIL only."""
+    if patched.get("no_tests") and baseline.get("no_tests"):
+        # Not a failure of the patch: nothing could judge it either way.
+        return TestVerdict(
+            status=UNVERIFIED,
+            reason="No tests exist to run before or after the patch, so nothing verifies it.",
+            per_test=False,
+        )
     if patched.get("status") != "PASS":
         errors = patched.get("errors") or []
         detail = f": {errors[0]}" if errors else "."

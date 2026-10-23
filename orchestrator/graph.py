@@ -148,6 +148,23 @@ def environment_agent(state: AgentState) -> AgentState:
     return update
 
 
+def _test_language(state: AgentState) -> str:
+    """The language of the code the coding agent repairs -- its top Python/Java function.
+
+    In a mixed repository the repository-wide language (a vote over the
+    retrieved chunks) can differ from it, and the tests must exercise the code
+    that is actually patched.
+    """
+    for chunk in state.get("relevant_code", []):
+        if (
+            chunk.get("language") in ("python", "java")
+            and chunk.get("type") in ("function", "method")
+            and not adapters.is_test_file(chunk.get("file", ""))
+        ):
+            return chunk["language"]
+    return state.get("language", "")
+
+
 def _python(state: AgentState) -> str | None:
     """The interpreter chosen by environment_agent, if any."""
     return (state.get("test_env") or {}).get("python")
@@ -175,7 +192,7 @@ def reproduction_agent(state: AgentState) -> AgentState:
             repo_path,
             state.get("issue", ""),
             state.get("relevant_code", []),
-            language=state.get("language", ""),
+            language=_test_language(state),
             backend=backend,
             stub_repro_path=state.get("stub_repro_path", ""),
             python=_python(state),
@@ -214,9 +231,17 @@ def coding_agent(state: AgentState) -> AgentState:
         )
 
     feedback = state.get("test_feedback", "")
+    issue = state.get("issue", "")
+    reproduction = state.get("reproduction") or {}
+    if reproduction.get("status") == "accepted":
+        # The test the verdict checks: it names the symptom the fix has to change.
+        issue += (
+            "\n\nTEST THAT REPRODUCES THE ISSUE (it fails on the current code and must pass after your fix):\n"
+            + reproduction["source"]
+        )
     try:
         patch, source = adapters.generate_patch(
-            issue=state.get("issue", ""),
+            issue=issue,
             relevant_code=adapters.format_relevant_code(relevant_code),
             similar_bugs=state.get("similar_bugs", []),
             strategy=state.get("strategy", ""),
@@ -269,7 +294,7 @@ def testing_agent(state: AgentState) -> AgentState:
     """
     repo_path = state.get("repo_path", "")
     patch = state.get("patch", "")
-    language = state.get("language", "")
+    language = _test_language(state)
 
     if not repo_path:
         return AgentState(
@@ -566,8 +591,8 @@ def build_graph():
 
     builder.add_node("repository_agent", _logged(repository_agent))
     builder.add_node("recommendation_agent", _logged(recommendation_agent))
-    # builder.add_node("environment_agent", _logged(environment_agent))
-    # builder.add_node("reproduction_agent", _logged(reproduction_agent))
+    builder.add_node("environment_agent", _logged(environment_agent))
+    builder.add_node("reproduction_agent", _logged(reproduction_agent))
     builder.add_node("coding_agent", _logged(coding_agent))
     builder.add_node("testing_agent", _logged(testing_agent))
     builder.add_node("reflection_agent", _logged(reflection_agent))
@@ -576,10 +601,9 @@ def build_graph():
 
     builder.add_edge(START, "repository_agent")
     builder.add_edge("repository_agent", "recommendation_agent")
-    # builder.add_edge("recommendation_agent", "environment_agent")
-    # builder.add_edge("environment_agent", "reproduction_agent")
-    # builder.add_edge("reproduction_agent", "coding_agent")
-    builder.add_edge("recommendation_agent", "coding_agent")
+    builder.add_edge("recommendation_agent", "environment_agent")
+    builder.add_edge("environment_agent", "reproduction_agent")
+    builder.add_edge("reproduction_agent", "coding_agent")
     builder.add_edge("coding_agent", "testing_agent")
     builder.add_conditional_edges("testing_agent", route_after_testing, ["reflection_agent", "human_review", END])
     builder.add_conditional_edges("reflection_agent", route_after_reflection, ["coding_agent", "human_review"])
