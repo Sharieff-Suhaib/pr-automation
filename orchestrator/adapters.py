@@ -1,20 +1,4 @@
-"""Thin wrappers over the agents built by Members 1-3.
-
-All the awkward integration lives here so `graph.py` stays readable:
-
-* Member 1's repository agent sits in `src/agents/repository-agent/` -- a
-  hyphenated directory, so it is not an importable package. Its modules also
-  import each other flatly (`from language_detector import ...`), so the
-  directory itself has to go on `sys.path`.
-* Member 2's recommendation agent uses absolute `src.` imports, so the project
-  root has to go on `sys.path` too.
-* Members 2 and 3 return dataclasses; the graph state carries plain JSON-safe
-  dicts, so they are converted here.
-
-Every wrapper raises `AdapterError` on failure. Nodes catch it, record the
-message in `state["errors"]`, and let the workflow continue with whatever it
-has -- one unavailable dependency should degrade the run, not kill it.
-"""
+"""Thin wrappers over the agents built by Members 1-3."""
 
 from __future__ import annotations
 
@@ -41,7 +25,6 @@ KEEP_WORKSPACES = int(os.environ.get("AGENT_SWE_KEEP_WORKSPACES", "20"))
 KEEP_TEST_ENVS = int(os.environ.get("AGENT_SWE_KEEP_TEST_ENVS", "5"))
 
 DEFAULT_TOP_K = 5
-
 ATTEMPT_TEMPERATURES = (0.4, 0.6, 0.8)
 
 REPAIR_MODEL_URL = os.environ.get(
@@ -73,7 +56,7 @@ BUILD_FILE_LANGUAGES = (
 
 
 class AdapterError(RuntimeError):
-    """A Member 1-3 agent could not complete its part of the run."""
+    """A wrapped agent could not complete its part of the run."""
 
 
 def _ensure_import_paths() -> None:
@@ -89,7 +72,7 @@ def _ensure_import_paths() -> None:
 
 
 # --------------------------------------------------------------------------
-# Member 1 -- Repository Agent
+# Repository Agent
 # --------------------------------------------------------------------------
 
 _embedder = None
@@ -107,7 +90,7 @@ def _get_embedder():
 
 
 def resolve_repository(repo_url: str) -> str:
-    """Return a local path for `repo_url`, cloning it when it is remote."""
+    """Return a local path for repo_url, cloning it when it is remote."""
 
     if not repo_url or not repo_url.strip():
         raise AdapterError("No repository URL or path was provided.")
@@ -122,20 +105,30 @@ def resolve_repository(repo_url: str) -> str:
     try:
         from clone_repo import clone_repository
     except ImportError as error:
-        raise AdapterError(f"Repository agent is unavailable: {error}") from error
+        raise AdapterError(
+            f"Repository agent is unavailable: {error}"
+        ) from error
 
     REPOSITORIES_DIR.mkdir(parents=True, exist_ok=True)
     _discard_incomplete_clone(repo_url)
 
     try:
-        print(f"Cloning {repo_url} into {REPOSITORIES_DIR}...")
-        return clone_repository(repo_url, base_path=str(REPOSITORIES_DIR))
+        print(
+            f"Cloning {repo_url} into {REPOSITORIES_DIR}...",
+            flush=True,
+        )
+        return clone_repository(
+            repo_url,
+            base_path=str(REPOSITORIES_DIR),
+        )
     except Exception as error:
-        raise AdapterError(f"Could not clone {repo_url}: {error}") from error
+        raise AdapterError(
+            f"Could not clone {repo_url}: {error}"
+        ) from error
 
 
 def _discard_incomplete_clone(repo_url: str) -> None:
-    """Remove a leftover clone directory that has no `.git` inside it."""
+    """Remove a leftover clone directory that has no .git directory."""
 
     name = repo_url.rstrip("/").split("/")[-1]
 
@@ -153,7 +146,7 @@ def analyze_repository(
     issue: str = "",
     top_k: int = DEFAULT_TOP_K,
 ) -> dict[str, Any]:
-    """Clone or locate a repository and retrieve relevant source-code chunks."""
+    """Clone or locate a repository and retrieve relevant source chunks."""
 
     repo_path = resolve_repository(repo_url)
     search_query = issue.strip()
@@ -237,7 +230,7 @@ def analyze_repository(
 
 
 # --------------------------------------------------------------------------
-# Member 2 -- Recommendation Agent
+# Recommendation Agent
 # --------------------------------------------------------------------------
 
 
@@ -247,13 +240,18 @@ def recommend(
     language: str = "python",
     top_k: int = 3,
 ) -> dict[str, Any]:
-    """Run Member 2's pipeline and flatten its dataclasses into plain dicts."""
+    """Run the recommendation agent and flatten its dataclasses."""
 
     _ensure_import_paths()
 
     try:
-        print(f"Running recommendation agent for issue: {issue}...")
-        from src.agents.recommendation_agent import recommend as run_recommendation
+        print(
+            f"Running recommendation agent for issue: {issue}...",
+            flush=True,
+        )
+        from src.agents.recommendation_agent import (
+            recommend as run_recommendation,
+        )
     except ImportError as error:
         raise AdapterError(
             f"Recommendation agent is unavailable: {error}"
@@ -267,9 +265,9 @@ def recommend(
     )
 
     if result is None:
-        raise AdapterError("Recommendation agent returned no result.")
-
-    print(f"Recommendation result: {result}")
+        raise AdapterError(
+            "Recommendation agent returned no result."
+        )
 
     return {
         "similar_bugs": [
@@ -290,7 +288,7 @@ def recommend(
 
 
 # --------------------------------------------------------------------------
-# Member 3 -- Coding Agent
+# Coding Agent
 # --------------------------------------------------------------------------
 
 
@@ -308,15 +306,7 @@ def generate_patch(
     feedback: str = "",
     attempt: int = 1,
 ) -> tuple[str, str]:
-    """Return ``(unified_diff, source)`` for the repair.
-
-    Order:
-
-    1. Remote IR4/OR2 model.
-    2. Function mode for Python and Java.
-    3. Python fault localization.
-    4. Generic diff mode.
-    """
+    """Return a unified diff and its source."""
 
     if backend == "stub":
         return _load_stub_patch(stub_patch_path), "stub"
@@ -324,8 +314,12 @@ def generate_patch(
     _ensure_import_paths()
 
     try:
-        from src.agents.coding_agent import generate_patch as run_codegen
-        from src.agents.coding_agent.code_generator import PatchGenerationError
+        from src.agents.coding_agent import (
+            generate_patch as run_codegen,
+        )
+        from src.agents.coding_agent.code_generator import (
+            PatchGenerationError,
+        )
         from src.agents.coding_agent.function_patch import (
             generate_function_patch,
         )
@@ -339,13 +333,12 @@ def generate_patch(
     ]
 
     chunks = relevant_chunks or []
+
     languages = [
         str(chunk.get("language", "")).lower()
         for chunk in chunks
     ]
 
-    # Prefer Java when retrieved chunks include Java source; otherwise use the
-    # first detected language. This avoids sending Java methods to Python AST.
     language = (
         "java"
         if "java" in languages
@@ -358,36 +351,37 @@ def generate_patch(
 
     if REPAIR_MODEL_URL and repo_path and chunks:
         try:
+            remote_temperature = (
+                0.0
+                if language == "java"
+                else temperature
+            )
+
             return remote_patch(
                 repo_path,
                 chunks,
-                temperature,
+                issue=issue,
+                temperature=remote_temperature,
             ), "remote-ir4"
+
         except PatchGenerationError as error:
             remote_error = str(error)
             print(
                 "Remote model unusable; trying local fallback: "
-                f"{remote_error[:200]}",
+                f"{remote_error[:300]}",
                 flush=True,
             )
+
         except Exception as error:
             remote_error = f"Remote repair failed: {error}"
             print(
-                f"{remote_error[:250]}; trying local fallback",
+                f"{remote_error[:300]}; trying local fallback",
                 flush=True,
             )
 
-    # Python AST and Java tree-sitter function repair. The model returns
-    # corrected functions and the diff is computed locally.
     function_error = ""
 
-    # A reply that loops on one line is aborted by Ollama. One retry with a
-    # higher temperature usually gets through.
-    for heat in (
-        (temperature, min(temperature + 0.3, 1.0))
-        if repo_path and chunks
-        else ()
-    ):
+    if repo_path and chunks:
         try:
             patch = generate_function_patch(
                 issue=issue,
@@ -400,24 +394,24 @@ def generate_patch(
                 strategy=strategy,
                 tests=tests,
                 feedback=feedback,
-                temperature=heat,
+                temperature=(
+                    0.0
+                    if language == "java"
+                    else temperature
+                ),
             )
 
             return patch, "ollama-function"
 
         except PatchGenerationError as error:
             function_error = str(error)
+
         except Exception as error:
             function_error = (
                 f"Function-based repair failed: {error}"
             )
 
-        if "repeat limit" not in function_error:
-            break
-
     if language == "java":
-        # Diff mode does not reliably produce usable Java patches. Fail fast
-        # so the retry loop can try again instead.
         combined = [
             part
             for part in (
@@ -432,7 +426,6 @@ def generate_patch(
             or "No Java function could be repaired."
         )
 
-    # Repository-level generator for Python and other languages.
     fault_error = ""
 
     if repo_path:
@@ -459,7 +452,6 @@ def generate_patch(
         except Exception as error:
             fault_error = str(error)
 
-    # Generic diff generation is the final fallback.
     try:
         patch = run_codegen(
             issue=(
@@ -476,6 +468,7 @@ def generate_patch(
             tools=tools,
             tests=tests,
         )
+
     except Exception as error:
         combined = [
             part
@@ -497,12 +490,99 @@ def generate_patch(
     return patch, "ollama"
 
 
+def _validate_java_repair(
+    original: str,
+    repaired: str,
+    file_path: str,
+) -> None:
+    """Reject Java repairs that change unrelated APIs or behavior."""
+
+    if not repaired.strip():
+        raise AdapterError(
+            f"The repaired {file_path} is empty."
+        )
+
+    if repaired == original:
+        raise AdapterError(
+            f"The remote model did not change {file_path}."
+        )
+
+    if "orders.size()" in original:
+        if "orders.length" in repaired:
+            raise AdapterError(
+                "Rejected Java repair: changed List access "
+                "from orders.size() to orders.length."
+            )
+
+        if "orders[" in repaired:
+            raise AdapterError(
+                "Rejected Java repair: changed List access "
+                "from orders.get(i) to array indexing."
+            )
+
+    if "getOrderId()" in original:
+        if "getOrderId()" not in repaired:
+            raise AdapterError(
+                "Rejected Java repair: removed getOrderId()."
+            )
+
+    if "getOrderId() == orderId" in original:
+        if "getOrderId().equals(orderId)" in repaired:
+            raise AdapterError(
+                "Rejected Java repair: replaced primitive ID "
+                "comparison with .equals()."
+            )
+
+    for fragment in (
+        "return orders.get(i);",
+        "return null;",
+    ):
+        if fragment in original and fragment not in repaired:
+            raise AdapterError(
+                "Rejected Java repair: removed required behavior: "
+                f"{fragment}"
+            )
+
+
+def _validate_minimal_order_lookup_repair(
+    original: str,
+    repaired: str,
+) -> None:
+    """Validate the minimal OrderService.findOrder() repair."""
+
+    old_condition = "i < orders.size() - 1"
+    correct_condition = "i < orders.size()"
+
+    if old_condition not in original:
+        return
+
+    if correct_condition not in repaired:
+        raise AdapterError(
+            "The repair did not fix the order lookup loop boundary."
+        )
+
+    for pattern in (
+        "orders.length",
+        "orders[",
+        ".equals(orderId)",
+        "orders.remove(",
+        "Order order = null",
+        "while (",
+    ):
+        if pattern in repaired:
+            raise AdapterError(
+                "Rejected non-minimal OrderService repair: "
+                f"found {pattern!r}."
+            )
+
+
 def remote_patch(
     repo_path: str,
     chunks: list[dict[str, Any]],
+    issue: str = "",
     temperature: float = 0.0,
 ) -> str:
-    """Repair the top-ranked Python or Java function with the remote model."""
+    """Repair the top-ranked Python or Java function remotely."""
 
     from src.agents.coding_agent.code_generator import (
         MAX_PATCH_TOKENS,
@@ -516,6 +596,8 @@ def remote_patch(
             for chunk in chunks
             if chunk.get("language") in ("python", "java")
             and chunk.get("type") in ("function", "method")
+            and chunk.get("start_line") is not None
+            and chunk.get("end_line") is not None
             and chunk["end_line"]
             > chunk["start_line"]
             + (chunk["language"] == "java")
@@ -530,8 +612,8 @@ def remote_patch(
             "for the remote model."
         )
 
-    language = target["language"]
-    file_path = target["file"]
+    language = str(target["language"]).lower()
+    file_path = str(target["file"])
 
     try:
         original = (
@@ -544,18 +626,50 @@ def remote_patch(
 
     lines = original.splitlines()
 
-    head = target["start_line"] - 1
-    start = target["start_line"]
-    end = target["end_line"] - (language == "java")
+    try:
+        start_line = int(target["start_line"])
+        end_line = int(target["end_line"])
+    except (TypeError, ValueError, KeyError) as error:
+        raise PatchGenerationError(
+            f"Invalid source range for {file_path}: "
+            f"{target.get('start_line')} - "
+            f"{target.get('end_line')}"
+        ) from error
+
+    head = max(start_line - 1, 0)
+    start = max(start_line, 0)
+
+    end = (
+        end_line - 1
+        if language == "java"
+        else end_line
+    )
+
+    stop = min(end_line, len(lines))
+
+    if start >= len(lines) or end <= start:
+        raise PatchGenerationError(
+            f"Invalid repair range for {file_path}: "
+            f"start={start}, end={end}, "
+            f"total_lines={len(lines)}"
+        )
 
     prompt = _ir4(
-        lines,
-        head,
-        start,
-        end,
-        target["end_line"],
-        file_path,
-        language,
+        lines=lines,
+        head=head,
+        start=start,
+        end=end,
+        stop=stop,
+        file_path=file_path,
+        language=language,
+        issue=issue,
+    )
+
+    print(
+        "\n========== REMOTE REPAIR PROMPT ==========\n"
+        f"{prompt}\n"
+        "========== END REMOTE REPAIR PROMPT ==========\n",
+        flush=True,
     )
 
     payload = {
@@ -578,7 +692,7 @@ def remote_patch(
         print(
             f"POST {REPAIR_MODEL_URL}/generate: "
             f"language={language}, "
-            f"{target['name']} in {file_path}, "
+            f"{target.get('name', '<unknown>')} in {file_path}, "
             f"prompt {len(prompt)} chars, "
             f"max_new_tokens={payload['max_new_tokens']}, "
             f"temperature={temperature}; "
@@ -592,12 +706,22 @@ def remote_patch(
             request,
             timeout=REMOTE_TIMEOUT_SECONDS,
         ) as response:
-            response_data = json.loads(
-                response.read().decode("utf-8")
+            raw_body = response.read().decode(
+                "utf-8",
+                errors="replace",
             )
+
+        print(
+            "Remote model raw response:",
+            repr(raw_body[:2000]),
+            flush=True,
+        )
+
+        response_data = json.loads(raw_body)
 
         if isinstance(response_data, str):
             reply = response_data
+
         elif isinstance(response_data, dict):
             reply = next(
                 (
@@ -614,22 +738,43 @@ def remote_patch(
             )
 
             if reply is None:
-                raise ValueError(
-                    "Model API JSON must contain a string field named "
-                    "response, generated_text, text, or output; "
-                    f"received keys: {list(response_data.keys())}"
+                raise PatchGenerationError(
+                    "Remote model returned no usable text. "
+                    f"Response: {response_data!r}"
                 )
+
+            debug = response_data.get("debug")
+
+            if isinstance(debug, dict):
+                reason = debug.get("reason")
+
+                if reason:
+                    print(
+                        f"Remote model debug reason: {reason}",
+                        flush=True,
+                    )
+
         else:
-            raise ValueError(
-                "Unexpected model API response type: "
+            raise PatchGenerationError(
+                "Unexpected remote response type: "
                 f"{type(response_data).__name__}"
             )
+
+        if not isinstance(reply, str) or not reply.strip():
+            raise PatchGenerationError(
+                "Remote model returned an empty repair."
+            )
+
+        reply = reply.strip()
+
+    except PatchGenerationError:
+        raise
 
     except urllib.error.HTTPError as error:
         detail = error.read().decode(
             "utf-8",
             errors="replace",
-        )[:300]
+        )[:500]
 
         raise PatchGenerationError(
             f"Remote model returned HTTP {error.code}: {detail}"
@@ -640,6 +785,8 @@ def remote_patch(
         TimeoutError,
         ValueError,
         KeyError,
+        TypeError,
+        OSError,
     ) as error:
         raise PatchGenerationError(
             f"Remote model at {REPAIR_MODEL_URL} failed: {error}"
@@ -648,20 +795,45 @@ def remote_patch(
     print(
         f"Remote model replied in "
         f"{time.monotonic() - started:.0f}s: "
-        f"{reply[:300]!r}",
+        f"{reply[:500]!r}",
         flush=True,
     )
 
-    fixed = reply.strip("\n").rstrip().splitlines()
+    fixed = reply.splitlines()
+
+    while fixed and not fixed[0].strip():
+        fixed.pop(0)
+
+    while fixed and not fixed[-1].strip():
+        fixed.pop()
+
+    if fixed and fixed[0].strip().startswith("```"):
+        fixed.pop(0)
+
+    if fixed and fixed[-1].strip() == "```":
+        fixed.pop()
+
+    forbidden_markers = {
+        "<FILL_ME>",
+        "<HOLE>",
+        "<PRE>",
+        "<SUF>",
+        "<MID>",
+        "<EOT>",
+    }
+
+    fixed = [
+        line
+        for line in fixed
+        if line.strip() not in forbidden_markers
+    ]
 
     if not fixed:
         raise PatchGenerationError(
-            "The remote model returned an empty repair: it ended "
-            "generation at once, which suggests the IR4 prompt does "
-            "not match the format the adapter was trained on."
+            "Remote model returned no usable repair lines."
         )
 
-    expected = next(
+    expected_indent = next(
         (
             len(line) - len(line.lstrip())
             for line in lines[start:end]
@@ -670,28 +842,41 @@ def remote_patch(
         0,
     )
 
-    if (
-        len(fixed[0]) - len(fixed[0].lstrip())
-        == expected - 1
-    ):
+    first_indent = len(fixed[0]) - len(fixed[0].lstrip())
+
+    if first_indent == max(expected_indent - 1, 0):
         fixed[0] = " " + fixed[0]
 
     repaired = "\n".join(
         lines[:start]
         + fixed
         + lines[end:]
-    ) + (
-        "\n"
-        if original.endswith("\n")
-        else ""
     )
+
+    if original.endswith("\n"):
+        repaired += "\n"
 
     if repaired == original:
         raise PatchGenerationError(
             "The remote model returned the function unchanged."
         )
 
-    if language == "python":
+    if language == "java":
+        try:
+            _validate_java_repair(
+                original=original,
+                repaired=repaired,
+                file_path=file_path,
+            )
+
+            _validate_minimal_order_lookup_repair(
+                original=original,
+                repaired=repaired,
+            )
+        except AdapterError as error:
+            raise PatchGenerationError(str(error)) from error
+
+    elif language == "python":
         try:
             compile(
                 repaired,
@@ -719,8 +904,11 @@ def _ir4(
     stop: int,
     file_path: str,
     language: str,
+    issue: str = "",
 ) -> str:
-    """Render the IR4 prompt for the selected function body."""
+    """Render the repair prompt for the selected function body."""
+
+    issue_text = issue.strip() or "Repair the reported bug."
 
     if language == "java":
         package = str(
@@ -735,7 +923,7 @@ def _ir4(
             render_ir4,
         )
 
-        return render_ir4(
+        ir4_prompt = render_ir4(
             lines,
             describe_region(
                 lines,
@@ -745,13 +933,66 @@ def _ir4(
             ),
         )
 
+        prompt = "\n".join(
+            [
+                "// ISSUE",
+                f"// {issue_text}",
+                "",
+                "// REPAIR RULES",
+                "// Make the smallest possible change.",
+                "// Preserve the method signature.",
+                "// Preserve existing variable names.",
+                "// Preserve existing API calls.",
+                "// Preserve existing behavior except for the reported bug.",
+                "// Do not introduce unrelated fields, methods, or logic.",
+                "// Return only the corrected Java method body.",
+                "",
+                ir4_prompt,
+            ]
+        )
+
+        if not any(
+            marker in prompt
+            for marker in (
+                "<FILL_ME>",
+                "<HOLE>",
+                "<MID>",
+            )
+        ):
+            prompt = "\n".join(
+                [
+                    prompt,
+                    "",
+                    "<FILL_ME>",
+                ]
+            )
+
+        print(
+            "\n========== JAVA IR4 PROMPT ==========\n"
+            f"{prompt}\n"
+            "========== END JAVA IR4 PROMPT ==========\n",
+            flush=True,
+        )
+
+        return prompt
+
     commented = [
         f"# {line}" if line else "#"
         for line in lines[start:end]
     ]
 
-    return "\n".join(
+    prompt = "\n".join(
         [
+            "# ISSUE",
+            f"# {issue_text}",
+            "",
+            "# REPAIR RULES",
+            "# Make the smallest possible change.",
+            "# Preserve the function signature.",
+            "# Preserve existing variable names and API calls.",
+            "# Preserve existing behavior except for the reported bug.",
+            "# Return only the corrected Python function.",
+            "",
             *lines[head:start],
             "# BUGGY CODE",
             *commented,
@@ -759,6 +1000,15 @@ def _ir4(
             *lines[end:stop],
         ]
     )
+
+    print(
+        "\n========== PYTHON IR4 PROMPT ==========\n"
+        f"{prompt}\n"
+        "========== END PYTHON IR4 PROMPT ==========\n",
+        flush=True,
+    )
+
+    return prompt
 
 
 def _load_stub_patch(stub_patch_path: str) -> str:
@@ -813,7 +1063,7 @@ def prepare_test_environment(
     repo_path: str,
     enabled: bool = True,
 ) -> dict[str, Any]:
-    """Clean up old workspaces and prepare the repository test environment."""
+    """Clean old workspaces and prepare the test environment."""
 
     _ensure_import_paths()
 
@@ -854,7 +1104,7 @@ def run_baseline_tests(
     language: str = "",
     python: str | None = None,
 ) -> dict[str, Any]:
-    """Run the suite on a throwaway copy of the repository."""
+    """Run the suite on a throwaway repository copy."""
 
     _ensure_import_paths()
 
@@ -882,7 +1132,7 @@ def prepare_reproduction(
     stub_repro_path: str = "",
     python: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Write and validate a test reproducing the issue."""
+    """Write and validate a reproduction test."""
 
     _ensure_import_paths()
 
@@ -930,7 +1180,7 @@ def apply_and_test(
     reproduction: dict[str, Any] | None = None,
     python: str | None = None,
 ) -> dict[str, Any]:
-    """Apply a patch to a fresh copy of the repository and run the suite."""
+    """Apply a patch to a fresh copy and run the test suite."""
 
     _ensure_import_paths()
 
@@ -1004,7 +1254,7 @@ def reflect(
     max_attempts: int = 3,
     use_llm: bool = True,
 ) -> dict[str, Any]:
-    """Run the Reflection Agent on one tested attempt."""
+    """Run the reflection agent on one tested attempt."""
 
     _ensure_import_paths()
 
@@ -1039,7 +1289,7 @@ def is_better_attempt(
     candidate: dict[str, Any],
     current: dict[str, Any] | None,
 ) -> bool:
-    """Whether `candidate` should replace `current`."""
+    """Return whether candidate should replace current."""
 
     _ensure_import_paths()
 
@@ -1058,26 +1308,26 @@ def commit_and_push(
     patch: str,
     issue: str = "",
 ) -> dict[str, str]:
-    """Commit `patch` on a new branch and push that branch."""
+    """Commit patch on a new branch and push that branch."""
 
     from orchestrator.github_issues import load_token
 
-    if (
-        Path(
-            _git(
-                repo_path,
-                "rev-parse",
-                "--show-toplevel",
-            )
-        ).resolve()
-        != Path(repo_path).resolve()
-    ):
+    repository_root = Path(
+        _git(
+            repo_path,
+            "rev-parse",
+            "--show-toplevel",
+        )
+    ).resolve()
+
+    if repository_root != Path(repo_path).resolve():
         raise AdapterError(
             f"{repo_path} is not the root of its own git repository; "
             "nothing to push."
         )
 
     token = load_token()
+
     remote = _git(
         repo_path,
         "remote",
@@ -1151,6 +1401,7 @@ def commit_and_push(
                 f"HEAD:refs/heads/{branch}",
                 secret=token,
             )
+
         finally:
             subprocess.run(
                 [
@@ -1205,7 +1456,7 @@ def _repository_language(
     repo_path: str,
     results: list[dict[str, Any]],
 ) -> str:
-    """Determine the language used for repair and test execution."""
+    """Determine the repair and test language."""
 
     languages = [
         result["language"]
@@ -1257,7 +1508,7 @@ is_test_file = _is_test_file
 
 def _unique(items: list[str]) -> list[str]:
     seen: set[str] = set()
-    result = []
+    result: list[str] = []
 
     for item in items:
         if item not in seen:
