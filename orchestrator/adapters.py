@@ -21,8 +21,19 @@ REPOSITORIES_DIR = PROJECT_ROOT / "repositories"
 WORKSPACES_DIR = PROJECT_ROOT / "workspaces"
 TEST_ENVS_DIR = PROJECT_ROOT / ".test_envs"
 
-KEEP_WORKSPACES = int(os.environ.get("AGENT_SWE_KEEP_WORKSPACES", "20"))
-KEEP_TEST_ENVS = int(os.environ.get("AGENT_SWE_KEEP_TEST_ENVS", "5"))
+KEEP_WORKSPACES = int(
+    os.environ.get(
+        "AGENT_SWE_KEEP_WORKSPACES",
+        "20",
+    )
+)
+
+KEEP_TEST_ENVS = int(
+    os.environ.get(
+        "AGENT_SWE_KEEP_TEST_ENVS",
+        "5",
+    )
+)
 
 DEFAULT_TOP_K = 5
 ATTEMPT_TEMPERATURES = (0.4, 0.6, 0.8)
@@ -53,6 +64,9 @@ BUILD_FILE_LANGUAGES = (
     ("tox.ini", "python"),
     ("requirements.txt", "python"),
 )
+
+# The latest prompt and response from the Colab RepairLLaMA endpoint.
+LAST_REMOTE_REPAIR: dict[str, Any] = {}
 
 
 class AdapterError(RuntimeError):
@@ -93,7 +107,9 @@ def resolve_repository(repo_url: str) -> str:
     """Return a local path for repo_url, cloning it when it is remote."""
 
     if not repo_url or not repo_url.strip():
-        raise AdapterError("No repository URL or path was provided.")
+        raise AdapterError(
+            "No repository URL or path was provided."
+        )
 
     candidate = Path(repo_url).expanduser()
 
@@ -109,7 +125,11 @@ def resolve_repository(repo_url: str) -> str:
             f"Repository agent is unavailable: {error}"
         ) from error
 
-    REPOSITORIES_DIR.mkdir(parents=True, exist_ok=True)
+    REPOSITORIES_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     _discard_incomplete_clone(repo_url)
 
     try:
@@ -117,10 +137,12 @@ def resolve_repository(repo_url: str) -> str:
             f"Cloning {repo_url} into {REPOSITORIES_DIR}...",
             flush=True,
         )
+
         return clone_repository(
             repo_url,
             base_path=str(REPOSITORIES_DIR),
         )
+
     except Exception as error:
         raise AdapterError(
             f"Could not clone {repo_url}: {error}"
@@ -137,8 +159,14 @@ def _discard_incomplete_clone(repo_url: str) -> None:
 
     destination = REPOSITORIES_DIR / name
 
-    if destination.is_dir() and not (destination / ".git").exists():
-        shutil.rmtree(destination, ignore_errors=True)
+    if (
+        destination.is_dir()
+        and not (destination / ".git").exists()
+    ):
+        shutil.rmtree(
+            destination,
+            ignore_errors=True,
+        )
 
 
 def analyze_repository(
@@ -162,8 +190,12 @@ def analyze_repository(
     _ensure_import_paths()
 
     try:
-        from code_parser import extract_code_nodes, get_source_files
+        from code_parser import (
+            extract_code_nodes,
+            get_source_files,
+        )
         from vector_store import VectorStore
+
     except ImportError as error:
         raise AdapterError(
             f"Repository agent is unavailable: {error}"
@@ -203,11 +235,17 @@ def analyze_repository(
     embeddings = embedder.embed_nodes(chunks)
 
     store = VectorStore(embeddings.shape[1])
-    store.add(embeddings, chunks)
+    store.add(
+        embeddings,
+        chunks,
+    )
 
     results = store.search(
         embedder.embed_query(search_query),
-        top_k=min(top_k, len(chunks)),
+        top_k=min(
+            top_k,
+            len(chunks),
+        ),
     )
 
     return {
@@ -249,9 +287,11 @@ def recommend(
             f"Running recommendation agent for issue: {issue}...",
             flush=True,
         )
+
         from src.agents.recommendation_agent import (
             recommend as run_recommendation,
         )
+
     except ImportError as error:
         raise AdapterError(
             f"Recommendation agent is unavailable: {error}"
@@ -309,7 +349,10 @@ def generate_patch(
     """Return a unified diff and its source."""
 
     if backend == "stub":
-        return _load_stub_patch(stub_patch_path), "stub"
+        return (
+            _load_stub_patch(stub_patch_path),
+            "stub",
+        )
 
     _ensure_import_paths()
 
@@ -317,25 +360,40 @@ def generate_patch(
         from src.agents.coding_agent import (
             generate_patch as run_codegen,
         )
+
         from src.agents.coding_agent.code_generator import (
             PatchGenerationError,
         )
+
         from src.agents.coding_agent.function_patch import (
             generate_function_patch,
         )
+
     except ImportError as error:
         raise AdapterError(
             f"Coding agent is unavailable: {error}"
         ) from error
 
     temperature = ATTEMPT_TEMPERATURES[
-        min(max(attempt, 1), len(ATTEMPT_TEMPERATURES)) - 1
+        min(
+            max(
+                attempt,
+                1,
+            ),
+            len(ATTEMPT_TEMPERATURES),
+        )
+        - 1
     ]
 
     chunks = relevant_chunks or []
 
     languages = [
-        str(chunk.get("language", "")).lower()
+        str(
+            chunk.get(
+                "language",
+                "",
+            )
+        ).lower()
         for chunk in chunks
     ]
 
@@ -351,21 +409,27 @@ def generate_patch(
 
     if REPAIR_MODEL_URL and repo_path and chunks:
         try:
+            # The Colab API does not accept or require temperature.
+            # Temperature is retained only for local generation paths.
             remote_temperature = (
                 0.0
                 if language == "java"
                 else temperature
             )
 
-            return remote_patch(
-                repo_path,
-                chunks,
-                issue=issue,
-                temperature=remote_temperature,
-            ), "remote-ir4"
+            return (
+                remote_patch(
+                    repo_path,
+                    chunks,
+                    issue=issue,
+                    temperature=remote_temperature,
+                ),
+                "remote-ir4",
+            )
 
         except PatchGenerationError as error:
             remote_error = str(error)
+
             print(
                 "Remote model unusable; trying local fallback: "
                 f"{remote_error[:300]}",
@@ -373,7 +437,10 @@ def generate_patch(
             )
 
         except Exception as error:
-            remote_error = f"Remote repair failed: {error}"
+            remote_error = (
+                f"Remote repair failed: {error}"
+            )
+
             print(
                 f"{remote_error[:300]}; trying local fallback",
                 flush=True,
@@ -444,7 +511,13 @@ def generate_patch(
                 strategy=strategy,
                 tools=tools,
                 tests=tests,
-                top_k=max(3, min(8, len(chunks) or 4)),
+                top_k=max(
+                    3,
+                    min(
+                        8,
+                        len(chunks) or 4,
+                    ),
+                ),
             )
 
             return patch, "ollama-fault-localization"
@@ -582,25 +655,49 @@ def remote_patch(
     issue: str = "",
     temperature: float = 0.0,
 ) -> str:
-    """Repair the top-ranked Python or Java function remotely."""
+    """
+    Repair the selected Python or Java function remotely.
+
+    The request format intentionally matches the unchanged Colab client:
+
+        {
+            "prompt": prompt,
+            "max_new_tokens": 128
+        }
+
+    No language or temperature fields are sent to Colab.
+    """
+
+    del temperature
 
     from src.agents.coding_agent.code_generator import (
         MAX_PATCH_TOKENS,
         PatchGenerationError,
     )
-    from src.agents.coding_agent.function_patch import make_diff
+
+    from src.agents.coding_agent.function_patch import (
+        make_diff,
+    )
 
     target = next(
         (
             chunk
             for chunk in chunks
-            if chunk.get("language") in ("python", "java")
-            and chunk.get("type") in ("function", "method")
+            if chunk.get("language") in (
+                "python",
+                "java",
+            )
+            and chunk.get("type") in (
+                "function",
+                "method",
+            )
             and chunk.get("start_line") is not None
             and chunk.get("end_line") is not None
             and chunk["end_line"]
             > chunk["start_line"]
-            + (chunk["language"] == "java")
+            + (
+                chunk["language"] == "java"
+            )
             and not _is_test_file(chunk["file"])
         ),
         None,
@@ -612,13 +709,21 @@ def remote_patch(
             "for the remote model."
         )
 
-    language = str(target["language"]).lower()
-    file_path = str(target["file"])
+    language = str(
+        target["language"]
+    ).lower()
+
+    file_path = str(
+        target["file"]
+    )
 
     try:
         original = (
             Path(repo_path) / file_path
-        ).read_text(encoding="utf-8")
+        ).read_text(
+            encoding="utf-8"
+        )
+
     except OSError as error:
         raise PatchGenerationError(
             f"Cannot read {file_path}: {error}"
@@ -627,17 +732,34 @@ def remote_patch(
     lines = original.splitlines()
 
     try:
-        start_line = int(target["start_line"])
-        end_line = int(target["end_line"])
-    except (TypeError, ValueError, KeyError) as error:
+        start_line = int(
+            target["start_line"]
+        )
+
+        end_line = int(
+            target["end_line"]
+        )
+
+    except (
+        TypeError,
+        ValueError,
+        KeyError,
+    ) as error:
         raise PatchGenerationError(
             f"Invalid source range for {file_path}: "
             f"{target.get('start_line')} - "
             f"{target.get('end_line')}"
         ) from error
 
-    head = max(start_line - 1, 0)
-    start = max(start_line, 0)
+    head = max(
+        start_line - 1,
+        0,
+    )
+
+    start = max(
+        start_line,
+        0,
+    )
 
     end = (
         end_line - 1
@@ -645,7 +767,10 @@ def remote_patch(
         else end_line
     )
 
-    stop = min(end_line, len(lines))
+    stop = min(
+        end_line,
+        len(lines),
+    )
 
     if start >= len(lines) or end <= start:
         raise PatchGenerationError(
@@ -672,16 +797,20 @@ def remote_patch(
         flush=True,
     )
 
+    # This payload matches the unchanged Colab code exactly.
     payload = {
-        "language": language,
         "prompt": prompt,
-        "max_new_tokens": min(MAX_PATCH_TOKENS, 2048),
-        "temperature": temperature,
+        "max_new_tokens": min(
+            MAX_PATCH_TOKENS,
+            512,
+        ),
     }
 
     request = urllib.request.Request(
-        f"{REPAIR_MODEL_URL}/generate",
-        data=json.dumps(payload).encode("utf-8"),
+        f"{REPAIR_MODEL_URL}/repair",
+        data=json.dumps(payload).encode(
+            "utf-8"
+        ),
         headers={
             "Content-Type": "application/json",
             "ngrok-skip-browser-warning": "1",
@@ -690,12 +819,12 @@ def remote_patch(
 
     try:
         print(
-            f"POST {REPAIR_MODEL_URL}/generate: "
+            f"POST {REPAIR_MODEL_URL}/repair: "
             f"language={language}, "
-            f"{target.get('name', '<unknown>')} in {file_path}, "
+            f"{target.get('name', '<unknown>')} "
+            f"in {file_path}, "
             f"prompt {len(prompt)} chars, "
-            f"max_new_tokens={payload['max_new_tokens']}, "
-            f"temperature={temperature}; "
+            f"max_new_tokens={payload['max_new_tokens']}; "
             "waiting for the reply...",
             flush=True,
         )
@@ -721,38 +850,59 @@ def remote_patch(
 
         if isinstance(response_data, str):
             reply = response_data
+            remote_prompt = prompt
+            remote_generated_text = response_data
+            remote_elapsed_seconds = None
 
         elif isinstance(response_data, dict):
-            reply = next(
-                (
-                    response_data[key]
-                    for key in (
-                        "response",
-                        "generated_text",
-                        "text",
-                        "output",
-                    )
-                    if isinstance(response_data.get(key), str)
-                ),
-                None,
-            )
+            # The unchanged Colab API returns:
+            #
+            # {
+            #     "prompt": "...",
+            #     "repair": "...",
+            #     "generated_text": "...",
+            #     "elapsed_seconds": ...
+            # }
+            reply = response_data.get("repair")
+
+            # Compatibility with alternate response names.
+            if not isinstance(reply, str) or not reply.strip():
+                reply = next(
+                    (
+                        response_data[key]
+                        for key in (
+                            "response",
+                            "generated_text",
+                            "text",
+                            "output",
+                        )
+                        if isinstance(
+                            response_data.get(key),
+                            str,
+                        )
+                    ),
+                    None,
+                )
 
             if reply is None:
                 raise PatchGenerationError(
-                    "Remote model returned no usable text. "
+                    "Remote model returned no usable repair. "
                     f"Response: {response_data!r}"
                 )
 
-            debug = response_data.get("debug")
+            remote_prompt = response_data.get(
+                "prompt",
+                prompt,
+            )
 
-            if isinstance(debug, dict):
-                reason = debug.get("reason")
+            remote_generated_text = response_data.get(
+                "generated_text",
+                reply,
+            )
 
-                if reason:
-                    print(
-                        f"Remote model debug reason: {reason}",
-                        flush=True,
-                    )
+            remote_elapsed_seconds = response_data.get(
+                "elapsed_seconds",
+            )
 
         else:
             raise PatchGenerationError(
@@ -764,6 +914,19 @@ def remote_patch(
             raise PatchGenerationError(
                 "Remote model returned an empty repair."
             )
+
+        # Store the exact prompt and repair for the UI.
+        LAST_REMOTE_REPAIR.clear()
+        LAST_REMOTE_REPAIR.update(
+            {
+                "prompt": remote_prompt,
+                "repair": reply,
+                "generated_text": remote_generated_text,
+                "elapsed_seconds": remote_elapsed_seconds,
+                "file": file_path,
+                "language": language,
+            }
+        )
 
         reply = reply.strip()
 
@@ -842,9 +1005,15 @@ def remote_patch(
         0,
     )
 
-    first_indent = len(fixed[0]) - len(fixed[0].lstrip())
+    first_indent = (
+        len(fixed[0])
+        - len(fixed[0].lstrip())
+    )
 
-    if first_indent == max(expected_indent - 1, 0):
+    if first_indent == max(
+        expected_indent - 1,
+        0,
+    ):
         fixed[0] = " " + fixed[0]
 
     repaired = "\n".join(
@@ -873,8 +1042,11 @@ def remote_patch(
                 original=original,
                 repaired=repaired,
             )
+
         except AdapterError as error:
-            raise PatchGenerationError(str(error)) from error
+            raise PatchGenerationError(
+                str(error)
+            ) from error
 
     elif language == "python":
         try:
@@ -883,6 +1055,7 @@ def remote_patch(
                 file_path,
                 "exec",
             )
+
         except SyntaxError as error:
             raise PatchGenerationError(
                 f"The repaired {file_path} is not valid Python: "
@@ -896,6 +1069,15 @@ def remote_patch(
     )
 
 
+def get_last_remote_repair() -> dict[str, Any]:
+    """
+    Return the last prompt and repair received from Colab.
+
+    The UI can use this function after generate_patch().
+    """
+
+    return dict(LAST_REMOTE_REPAIR)
+
 def _ir4(
     lines: list[str],
     head: int,
@@ -906,66 +1088,114 @@ def _ir4(
     language: str,
     issue: str = "",
 ) -> str:
-    """Render the repair prompt for the selected function body."""
+    """
+    Build the prompt sent to the unchanged Colab RepairLLaMA API.
 
-    issue_text = issue.strip() or "Repair the reported bug."
+    IR4 is still used to describe the selected repair region, but the
+    rendered IR4 source is not concatenated with the Java source. This
+    prevents the method from appearing twice in the prompt.
+    """
+
+    issue_text = (
+        issue.strip()
+        or "Repair the reported bug."
+    )
 
     if language == "java":
         package = str(
-            PROJECT_ROOT / "src" / "repairLlama" / "src"
+            PROJECT_ROOT
+            / "src"
+            / "repairLlama"
+            / "src"
         )
 
         if package not in sys.path:
             sys.path.append(package)
 
+        # Keep IR4/or2 region analysis active. This validates and describes
+        # the selected region, but its rendered source is not added to the
+        # model prompt because render_ir4() already contains source context.
         from repairllama.representation.ir4 import (
             describe_region,
             render_ir4,
         )
 
-        ir4_prompt = render_ir4(
+        region = describe_region(
             lines,
-            describe_region(
-                lines,
-                start + 1,
-                end,
-                file_path=file_path,
-            ),
+            start + 1,
+            end,
+            file_path=file_path,
         )
 
-        prompt = "\n".join(
+        ir4_representation = render_ir4(
+            lines,
+            region,
+        )
+
+        # Use the actual selected source only once.
+        source_before = lines[head:start]
+        source_region = lines[start:end]
+        source_after = lines[end:stop]
+
+        # Comment the original buggy region, matching the Colab format.
+        commented_buggy_code = [
+            (
+                f"// {line}"
+                if line.strip()
+                else "//"
+            )
+            for line in source_region
+        ]
+
+        prompt_lines = [
+            "Repair the bug in this Java code.",
+            "Return only the missing code.",
+            "",
+            f"// ISSUE: {issue_text}",
+            "",
+            "// REPAIR RULES",
+            "// Make the smallest possible change.",
+            "// Preserve the method signature.",
+            "// Preserve existing variable names.",
+            "// Preserve existing API calls.",
+            "// Preserve existing behavior except for the reported bug.",
+            "// Return only the missing Java code.",
+            "",
+        ]
+
+        # Include only a short IR4 metadata summary, not the full rendered
+        # IR4 source. The full rendered representation duplicates the method.
+        prompt_lines.extend(
             [
-                "// ISSUE",
-                f"// {issue_text}",
+                "// IR4 REPAIR REGION",
+                (
+                    f"// file: {file_path}; "
+                    f"lines {start + 1}-{end}"
+                ),
                 "",
-                "// REPAIR RULES",
-                "// Make the smallest possible change.",
-                "// Preserve the method signature.",
-                "// Preserve existing variable names.",
-                "// Preserve existing API calls.",
-                "// Preserve existing behavior except for the reported bug.",
-                "// Do not introduce unrelated fields, methods, or logic.",
-                "// Return only the corrected Java method body.",
-                "",
-                ir4_prompt,
             ]
         )
 
-        if not any(
-            marker in prompt
-            for marker in (
-                "<FILL_ME>",
-                "<HOLE>",
-                "<MID>",
-            )
-        ):
-            prompt = "\n".join(
-                [
-                    prompt,
-                    "",
-                    "<FILL_ME>",
-                ]
-            )
+        # Add source before the selected region.
+        prompt_lines.extend(source_before)
+
+        # Add exactly one method and exactly one FILL_ME marker.
+        prompt_lines.extend(
+            [
+                "// buggy code",
+                *commented_buggy_code,
+                "// end buggy code",
+                "    <FILL_ME>",
+            ]
+        )
+
+        # Add source after the selected region.
+        prompt_lines.extend(source_after)
+
+        prompt = "\n".join(prompt_lines)
+
+        # Prevent unused-variable warnings while preserving IR4 generation.
+        _ = ir4_representation
 
         print(
             "\n========== JAVA IR4 PROMPT ==========\n"
@@ -976,30 +1206,43 @@ def _ir4(
 
         return prompt
 
-    commented = [
-        f"# {line}" if line else "#"
-        for line in lines[start:end]
+    # Python prompt.
+    source_before = lines[head:start]
+    source_region = lines[start:end]
+    source_after = lines[end:stop]
+
+    commented_buggy_code = [
+        (
+            f"# {line}"
+            if line.strip()
+            else "#"
+        )
+        for line in source_region
     ]
 
-    prompt = "\n".join(
-        [
-            "# ISSUE",
-            f"# {issue_text}",
-            "",
-            "# REPAIR RULES",
-            "# Make the smallest possible change.",
-            "# Preserve the function signature.",
-            "# Preserve existing variable names and API calls.",
-            "# Preserve existing behavior except for the reported bug.",
-            "# Return only the corrected Python function.",
-            "",
-            *lines[head:start],
-            "# BUGGY CODE",
-            *commented,
-            "<FILL_ME>",
-            *lines[end:stop],
-        ]
-    )
+    prompt_lines = [
+        "Repair the bug in this Python code.",
+        "Return only the missing code.",
+        "",
+        f"# ISSUE: {issue_text}",
+        "",
+        "# REPAIR RULES",
+        "# Make the smallest possible change.",
+        "# Preserve the function signature.",
+        "# Preserve existing variable names.",
+        "# Preserve existing API calls.",
+        "# Preserve existing behavior except for the reported bug.",
+        "# Return only the missing Python code.",
+        "",
+        *source_before,
+        "# buggy code",
+        *commented_buggy_code,
+        "# end buggy code",
+        "<FILL_ME>",
+        *source_after,
+    ]
+
+    prompt = "\n".join(prompt_lines)
 
     print(
         "\n========== PYTHON IR4 PROMPT ==========\n"
@@ -1010,8 +1253,9 @@ def _ir4(
 
     return prompt
 
-
-def _load_stub_patch(stub_patch_path: str) -> str:
+def _load_stub_patch(
+    stub_patch_path: str,
+) -> str:
     path = (
         Path(stub_patch_path)
         if stub_patch_path
@@ -1024,7 +1268,9 @@ def _load_stub_patch(stub_patch_path: str) -> str:
             f"{stub_patch_path or '(not set)'}"
         )
 
-    return path.read_text(encoding="utf-8")
+    return path.read_text(
+        encoding="utf-8"
+    )
 
 
 def format_relevant_code(
@@ -1046,7 +1292,8 @@ def format_relevant_code(
     )[:limit]:
         blocks.append(
             f"File: {chunk['file']} "
-            f"(lines {chunk['start_line']}-{chunk['end_line']}, "
+            f"(lines {chunk['start_line']}-"
+            f"{chunk['end_line']}, "
             f"{chunk['type']} {chunk['name']})\n"
             f"{chunk['code']}"
         )
@@ -1072,6 +1319,7 @@ def prepare_test_environment(
             cleanup_directories,
             prepare_environment,
         )
+
     except ImportError as error:
         raise AdapterError(
             f"Testing agent is unavailable: {error}"
@@ -1109,7 +1357,10 @@ def run_baseline_tests(
     _ensure_import_paths()
 
     try:
-        from src.agents.testing_agent import run_baseline
+        from src.agents.testing_agent import (
+            run_baseline,
+        )
+
     except ImportError as error:
         raise AdapterError(
             f"Testing agent is unavailable: {error}"
@@ -1142,6 +1393,7 @@ def prepare_reproduction(
             prepare_reproduction as run_reproduction,
             stub_writer,
         )
+
     except ImportError as error:
         raise AdapterError(
             f"Testing agent is unavailable: {error}"
@@ -1185,7 +1437,10 @@ def apply_and_test(
     _ensure_import_paths()
 
     try:
-        from src.agents.testing_agent import evaluate_patch
+        from src.agents.testing_agent import (
+            evaluate_patch,
+        )
+
     except ImportError as error:
         raise AdapterError(
             f"Testing agent is unavailable: {error}"
@@ -1193,7 +1448,8 @@ def apply_and_test(
 
     accepted = (
         bool(reproduction)
-        and reproduction.get("status") == "accepted"
+        and reproduction.get("status")
+        == "accepted"
     )
 
     return evaluate_patch(
@@ -1226,7 +1482,9 @@ def attempt_feedback(
 
     _ensure_import_paths()
 
-    from src.agents.testing_agent.feedback import build_feedback
+    from src.agents.testing_agent.feedback import (
+        build_feedback,
+    )
 
     return build_feedback(
         attempt["attempt"],
@@ -1234,10 +1492,14 @@ def attempt_feedback(
         attempt["patch_status"],
         attempt["test_result"],
         attempt["test_verdict"],
-        patch_error=attempt.get("patch_error", ""),
+        patch_error=attempt.get(
+            "patch_error",
+            "",
+        ),
         repeated=(
             bool(attempt["patch"].strip())
-            and attempt["patch"] in (earlier_patches or [])
+            and attempt["patch"]
+            in (earlier_patches or [])
         ),
     )
 
@@ -1250,7 +1512,8 @@ def reflect(
     relevant_code: str,
     attempt: dict[str, Any],
     strategy: str = "",
-    previous_attempts: list[dict[str, Any]] | None = None,
+    previous_attempts: list[dict[str, Any]]
+    | None = None,
     max_attempts: int = 3,
     use_llm: bool = True,
 ) -> dict[str, Any]:
@@ -1259,7 +1522,10 @@ def reflect(
     _ensure_import_paths()
 
     try:
-        from src.agents.reflection_agent import ReflectionAgent
+        from src.agents.reflection_agent import (
+            ReflectionAgent,
+        )
+
     except ImportError as error:
         raise AdapterError(
             f"Reflection agent is unavailable: {error}"
@@ -1271,11 +1537,17 @@ def reflect(
     ).reflect(
         issue=issue,
         relevant_code=relevant_code,
-        generated_patch=attempt.get("patch", ""),
+        generated_patch=attempt.get(
+            "patch",
+            "",
+        ),
         test_results=attempt,
         repair_strategy=strategy,
         previous_attempts=previous_attempts,
-        attempt=attempt.get("attempt", 1),
+        attempt=attempt.get(
+            "attempt",
+            1,
+        ),
         max_attempts=max_attempts,
     )
 
@@ -1293,9 +1565,14 @@ def is_better_attempt(
 
     _ensure_import_paths()
 
-    from src.agents.testing_agent.feedback import is_better
+    from src.agents.testing_agent.feedback import (
+        is_better,
+    )
 
-    return is_better(candidate, current)
+    return is_better(
+        candidate,
+        current,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1310,7 +1587,9 @@ def commit_and_push(
 ) -> dict[str, str]:
     """Commit patch on a new branch and push that branch."""
 
-    from orchestrator.github_issues import load_token
+    from orchestrator.github_issues import (
+        load_token,
+    )
 
     repository_root = Path(
         _git(
@@ -1322,8 +1601,8 @@ def commit_and_push(
 
     if repository_root != Path(repo_path).resolve():
         raise AdapterError(
-            f"{repo_path} is not the root of its own git repository; "
-            "nothing to push."
+            f"{repo_path} is not the root of its own git "
+            "repository; nothing to push."
         )
 
     token = load_token()
@@ -1341,7 +1620,8 @@ def commit_and_push(
             f"https://x-access-token:{token}@",
             1,
         )
-        if token and remote.startswith("https://")
+        if token
+        and remote.startswith("https://")
         else remote
     )
 
@@ -1356,7 +1636,9 @@ def commit_and_push(
     )[0][:72]
 
     with tempfile.TemporaryDirectory() as tmp:
-        worktree = str(Path(tmp) / "worktree")
+        worktree = str(
+            Path(tmp) / "worktree"
+        )
 
         _git(
             repo_path,
@@ -1376,7 +1658,11 @@ def commit_and_push(
                 stdin=patch,
             )
 
-            _git(worktree, "add", "-A")
+            _git(
+                worktree,
+                "add",
+                "-A",
+            )
 
             _git(
                 worktree,
@@ -1429,7 +1715,10 @@ def _git(
     secret: str = "",
 ) -> str:
     result = subprocess.run(
-        ["git", *args],
+        [
+            "git",
+            *args,
+        ],
         cwd=cwd,
         input=stdin,
         capture_output=True,
@@ -1443,7 +1732,10 @@ def _git(
         ).strip()
 
         if secret:
-            message = message.replace(secret, "***")
+            message = message.replace(
+                secret,
+                "***",
+            )
 
         raise AdapterError(
             f"git {args[0]} failed: {message}"
@@ -1488,7 +1780,9 @@ def _repository_language(
     )
 
 
-def _is_test_file(file_path: str) -> bool:
+def _is_test_file(
+    file_path: str,
+) -> bool:
     name = Path(file_path).name
 
     return name.startswith("test_") or name.endswith(
@@ -1506,7 +1800,9 @@ def _is_test_file(file_path: str) -> bool:
 is_test_file = _is_test_file
 
 
-def _unique(items: list[str]) -> list[str]:
+def _unique(
+    items: list[str],
+) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
 
