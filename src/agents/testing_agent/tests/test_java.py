@@ -115,6 +115,73 @@ def test_test_methods_that_do_not_compile_are_dropped_and_the_rest_kept(repo, tm
     assert "remove(103)" not in reproduction["source"]
 
 
+def test_tests_that_never_call_the_repaired_method_are_dropped():
+    from src.agents.testing_agent.reproduction import keep_tests_calling
+
+    unrelated = REPRO.replace(
+        "\n}\n",
+        "\n    @Test\n    public void testIssueTopStudents() {\n"
+        "        assertEquals(2, new StudentService().getTopStudents(80.0).size());\n    }\n}\n",
+    )
+
+    kept = keep_tests_calling(unrelated, ["contains"])
+
+    assert "testIssueLastStudentIsFound" in kept and "testIssueTopStudents" not in kept
+    with pytest.raises(ValueError, match="No test calls average"):
+        keep_tests_calling(unrelated, ["average"])
+
+
+def test_the_empty_input_check_reproduces_a_divide_by_zero_and_the_guard_solves_it(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "Grades.java").write_text(
+        "import java.util.*;\n\npublic class Grades {\n"
+        "    private List<Double> marks = new ArrayList<>();\n\n"
+        "    public double average() {\n"
+        "        double total = 0;\n"
+        "        for (double m : marks) total += m;\n"
+        "        return total / marks.size();\n"
+        "    }\n}\n",
+        encoding="utf-8",
+    )
+    guard = (
+        "--- a/Grades.java\n+++ b/Grades.java\n@@ -6,2 +6,5 @@\n"
+        "     public double average() {\n+        if (marks.isEmpty()) {\n+            return 0;\n+        }\n"
+        "         double total = 0;\n"
+    )
+    chunk = {"file": "Grades.java", "name": "average", "type": "method", "language": "java",
+             "start_line": 6, "end_line": 10, "code": ""}
+    workspaces = tmp_path / "ws"
+
+    # The model's test asserts nothing about empty input: rejected, the built-in check takes over.
+    reproduction, baseline = prepare_reproduction(
+        root, "The average raises an exception.", [chunk], workspaces,
+        lambda prompt: "public class AgentReproTest { @Test public void testIssueX() { assertEquals(0.0, 0.0); } }",
+        language="java",
+    )
+
+    assert reproduction["status"] == "accepted", reproduction["reason"]
+    assert "built-in check" in reproduction["reason"]
+    result = evaluate_patch(
+        root, guard, workspaces, language="java", baseline=baseline,
+        extra_files={reproduction["path"]: reproduction["source"]}, reproduction_tests=reproduction["tests"],
+    )
+    assert result["test_verdict"]["status"] == "solved", result["test_verdict"]["reason"]
+
+
+def test_a_test_expecting_the_reported_exception_is_dropped():
+    from src.agents.testing_agent.reproduction import drop_guessed_exceptions
+
+    guessed = REPRO.replace(
+        "\n}\n",
+        "\n    @Test\n    public void testIssueThrows() {\n"
+        "        assertThrows(IllegalStateException.class, () -> new StudentService().contains(1));\n    }\n}\n",
+    )
+
+    assert "testIssueThrows" not in drop_guessed_exceptions(guessed, "contains() raises an exception.")
+    assert "testIssueThrows" in drop_guessed_exceptions(guessed, "contains() should throw for unknown ids.")
+
+
 def test_clean_java_test_adds_imports_and_the_package_and_rejects_copies():
     source = clean_java_test("```java\npackage wrong;\n" + REPRO + "```", "package school;\n" + SERVICE)
 

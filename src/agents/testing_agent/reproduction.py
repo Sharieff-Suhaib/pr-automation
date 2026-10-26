@@ -116,6 +116,11 @@ def prepare_reproduction(
     if lang == "java":
         target = chunks[0]["file"]
         target_source = (repository / target).read_text(encoding="utf-8", errors="replace")
+        # The method the coding agent repairs (its top-ranked function): every
+        # test has to exercise it. Other retrieved methods are context only -- a
+        # test of one of them says nothing about the fix, and once it asserted
+        # a wrong expectation that failed before and after a correct fix.
+        methods = [chunks[0]["name"]]
         reproduction["path"] = str(PurePosixPath(target).parent / f"{JAVA_REPRO_CLASS}.java")
     path = reproduction["path"]
 
@@ -123,7 +128,7 @@ def prepare_reproduction(
     for attempt in range(1, max_attempts + 1):
         reproduction["attempts"] = attempt
         if lang == "java":
-            prompt = build_java_prompt(issue, target, target_source, feedback)
+            prompt = build_java_prompt(issue, target, target_source, feedback, methods)
         else:
             prompt = build_prompt(issue, chunks, example_test(repository, chunks), feedback)
 
@@ -135,7 +140,7 @@ def prepare_reproduction(
 
         try:
             if lang == "java":
-                source = clean_java_test(raw, target_source)
+                source = drop_guessed_exceptions(keep_tests_calling(clean_java_test(raw, target_source), methods), issue)
             else:
                 source = clean_test_source(raw, chunks, repository)
         except ValueError as error:
@@ -175,6 +180,23 @@ def prepare_reproduction(
         if accepted:
             return reproduction, baseline
         feedback = _feedback(reason, source)
+
+    if lang == "java" and (source := java_property_test(issue, target_source, methods)):
+        # The model's tests reproduced nothing; a property any fix must satisfy might.
+        baseline = run_baseline(
+            repository, workspace_root, language=language, extra_files={path: source}, python=python
+        )
+        accepted, reason, tests = classify(baseline)
+        if accepted:
+            reproduction.update(
+                status="accepted",
+                reason=f"{reason} (built-in check: empty input must give a finite result, not an exception)",
+                source=source,
+                tests=tests,
+                baseline_outcomes=_repro_only(baseline.get("cases", {})),
+                messages=_repro_only(baseline.get("messages", {})),
+            )
+            return reproduction, baseline
 
     reproduction["tests"] = []
     return reproduction, plain_baseline()
@@ -268,8 +290,10 @@ def build_prompt(
     return "\n".join(parts)
 
 
-def build_java_prompt(issue: str, target: str, target_source: str, feedback: str = "") -> str:
-    """The brief for a JUnit 5 reproduction test of the class in ``target``."""
+def build_java_prompt(
+    issue: str, target: str, target_source: str, feedback: str = "", methods: list[str] | None = None
+) -> str:
+    """The brief for a JUnit 5 reproduction test of ``methods`` in ``target``."""
     lines = target_source.splitlines()
     shown = "\n".join(lines[:_JAVA_FILE_LINES]) + ("\n// ... (rest of the file omitted)" if len(lines) > _JAVA_FILE_LINES else "")
     parts = [
@@ -279,8 +303,12 @@ def build_java_prompt(issue: str, target: str, target_source: str, feedback: str
         f"Write a JUnit 5 test class named {JAVA_REPRO_CLASS} that reproduces the issue.",
         "Rules:",
         f"- Declare `public class {JAVA_REPRO_CLASS}` with 1 or 2 methods annotated @Test, each named testIssue<WhatItChecks>.",
+        *([f"- Every test must call {' or '.join(methods)}: that is the code the issue is about."] if methods else []),
         "- Each test checks ONE concrete symptom the issue describes, with the expected result the issue states.",
         "  Do not assert anything the issue does not say (no guessed exceptions, orders or messages).",
+        "- Expect an exception only if the issue says the method SHOULD throw one; valid input must never throw.",
+        "  If the issue says the code raises an exception, that exception IS the bug: set up the failing case",
+        "  (for example an empty list) and assert the method returns a sensible value without throwing.",
         "- Each test must FAIL on the code above, because of the bug, and PASS once the bug is fixed.",
         "- Assert the correct behaviour the issue asks for, never the current buggy behaviour.",
         "- Use the classes above as they are, through their constructors and methods. Do not copy or redefine them.",
@@ -335,34 +363,131 @@ def drop_broken_java_tests(source: str, baseline: dict[str, Any]) -> str | None:
     class -- an error in a field, an import or the repository itself is not
     fixed by dropping tests -- and at least one test is left.
     """
-    from tree_sitter_languages import get_parser  # noqa: PLC0415 -- only Java needs it
-
     text = baseline.get("output", "") + "\n" + "\n".join(baseline.get("errors") or [])
     errors = _JAVAC_ERROR_RE.findall(text)
     if not errors or any(name != f"{JAVA_REPRO_CLASS}.java" for name, _ in errors):
         return None
     bad_lines = {int(line) for _, line in errors}
 
+    tests = _java_test_spans(source)
+    broken = [span for span in tests if any(span[0] <= line <= span[1] for line in bad_lines)]
+    outside = [line for line in bad_lines if not any(start <= line <= end for start, end in tests)]
+    if not broken or outside or len(broken) == len(tests):
+        return None
+    return _without_spans(source, broken)
+
+
+def keep_tests_calling(source: str, methods: list[str]) -> str:
+    """The test class with only the @Test methods that call one of ``methods``.
+
+    A test that never calls the method being repaired cannot show that the
+    repair works -- it only makes the verdict depend on some other code.
+    Raises ``ValueError`` (a reason the model can act on) when none is left.
+    """
+    lines = source.splitlines(keepends=True)
+    calls = re.compile(r"\b(" + "|".join(map(re.escape, methods)) + r")\s*\(")
+    tests = _java_test_spans(source)
+    unrelated = [(start, end) for start, end in tests if not calls.search("".join(lines[start - 1 : end]))]
+    if len(unrelated) == len(tests):
+        raise ValueError(f"No test calls {', '.join(methods)}, the code the issue is about.")
+    return _without_spans(source, unrelated)
+
+
+_EMPTY_INPUT_SYMPTOM = re.compile(
+    r"divi(de|sion|ded)|by zero|\bzero\b|\bempty\b|\bnan\b|average|\bmean\b|exception|crash|validat"
+)
+
+
+def java_property_test(issue: str, target_source: str, methods: list[str]) -> str | None:
+    """A reproduction test needing no model: on an empty object, ``method()``
+    must neither throw nor return NaN/Infinity.
+
+    Divide-by-zero on an empty collection is the commonest form of the bugs
+    these issues describe; the buggy code fails this (0.0 / 0 is NaN, an int
+    division throws) and any correct fix passes it. Only for a method without
+    arguments returning a number, on a class that `new X()` can build.
+    """
+    if not _EMPTY_INPUT_SYMPTOM.search(issue.lower()):
+        return None
+    for method in methods:
+        found = re.search(rf"public\s+(double|float|int|long)\s+{re.escape(method)}\s*\(\s*\)", target_source)
+        if not found:
+            continue
+        declared = list(re.finditer(r"\bclass\s+(\w+)", target_source[: found.start()]))
+        if not declared:
+            continue
+        cls = declared[-1].group(1)
+        constructors = re.findall(rf"\b{cls}\s*\(([^)]*)\)\s*\{{", target_source)
+        if constructors and all(params.strip() for params in constructors):
+            continue  # every constructor needs arguments
+        floating = found.group(1) in ("double", "float")
+        package = _JAVA_PACKAGE_RE.search(target_source)
+        check = (
+            f'        double result = assertDoesNotThrow(() -> subject.{method}());\n'
+            f'        assertFalse(Double.isNaN(result) || Double.isInfinite(result),\n'
+            f'            "{method}() returned " + result + " for an empty {cls}");\n'
+            if floating
+            else f"        assertDoesNotThrow(() -> subject.{method}());\n"
+        )
+        return (
+            (package.group(0).strip() + "\n" if package else "")
+            + "import org.junit.jupiter.api.Test;\n"
+            "import static org.junit.jupiter.api.Assertions.*;\n\n"
+            f"public class {JAVA_REPRO_CLASS} {{\n"
+            "    @Test\n"
+            f"    public void testIssue{method[0].upper() + method[1:]}OnEmptyInput() {{\n"
+            f"        {cls} subject = new {cls}();\n"
+            f"{check}"
+            "    }\n"
+            "}\n"
+        )
+    return None
+
+
+def drop_guessed_exceptions(source: str, issue: str) -> str:
+    """The test class without tests expecting an exception the issue never asks for.
+
+    An issue that reports an exception ("it raises an exception") reports the
+    bug; a test expecting that exception asserts the bug, and a correct fix
+    could never pass it. Only "should/must throw" in the issue allows one.
+    Raises ``ValueError`` when no test is left.
+    """
+    if re.search(r"\b(should|must|expected to|needs? to)\s+(throw|raise)", issue, re.I):
+        return source
+    lines = source.splitlines(keepends=True)
+    tests = _java_test_spans(source)
+    guessed = [(start, end) for start, end in tests if "assertThrows" in "".join(lines[start - 1 : end])]
+    if guessed and len(guessed) == len(tests):
+        raise ValueError(
+            "Every test expects an exception, but the issue does not say the method should throw one. "
+            "If the issue reports an exception, that exception is the bug: assert it is not thrown."
+        )
+    return _without_spans(source, guessed)
+
+
+def _java_test_spans(source: str) -> list[tuple[int, int]]:
+    """1-based inclusive line spans of the @Test methods (the annotation is part of them)."""
+    from tree_sitter_languages import get_parser  # noqa: PLC0415 -- only Java needs it
+
     data = source.encode("utf-8")
-    tests: list[tuple[int, int]] = []  # 1-based inclusive line spans of @Test methods
+    spans: list[tuple[int, int]] = []
 
     def walk(node) -> None:
         if node.type == "method_declaration":
             modifiers = next((c for c in node.children if c.type == "modifiers"), None)
             if modifiers is not None and b"@Test" in data[modifiers.start_byte : modifiers.end_byte]:
-                tests.append((node.start_point[0] + 1, node.end_point[0] + 1))
+                spans.append((node.start_point[0] + 1, node.end_point[0] + 1))
             return
         for child in node.children:
             walk(child)
 
     walk(get_parser("java").parse(data).root_node)
-    broken = [span for span in tests if any(span[0] <= line <= span[1] for line in bad_lines)]
-    outside = [line for line in bad_lines if not any(start <= line <= end for start, end in tests)]
-    if not broken or outside or len(broken) == len(tests):
-        return None
+    return spans
 
+
+def _without_spans(source: str, spans: list[tuple[int, int]]) -> str:
     lines = source.splitlines(keepends=True)
-    for start, end in sorted(broken, reverse=True):  # @Test is in the span: it is a modifier
+    for start, end in sorted(spans, reverse=True):
         del lines[start - 1 : end]
     return "".join(lines)
 

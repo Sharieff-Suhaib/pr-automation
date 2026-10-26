@@ -11,6 +11,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 from orchestrator import adapters
 
 SAMPLE_REPO = Path(__file__).resolve().parents[1] / "sample_repo"
@@ -72,7 +74,7 @@ def test_the_remote_model_gets_one_commented_line_and_its_reply_replaces_it(tmp_
     patch = adapters.remote_patch(str(tmp_path), [chunk], issue="the last order is never found")
 
     assert sent == [
-        "Repair the bug in this Java code.\nReturn only the missing code.\n\n"
+        "Repair the bug in this Java code: the last order is never found.\nReturn only the missing code.\n\n"
         "    public Order findOrder(int orderId) {\n"
         "// buggy code\n"
         "//         for (int i = 0; i < orders.size() - 1; i++) {\n"
@@ -88,6 +90,139 @@ def test_the_remote_model_gets_one_commented_line_and_its_reply_replaces_it(tmp_
     assert "-        for (int i = 0; i < orders.size() - 1; i++) {\n" \
            "+        for (int i = 0; i < orders.size(); i++) {\n" in patch
     subprocess.run(["git", "apply", "--check", "-"], cwd=tmp_path, input=patch, text=True, check=True)
+
+
+STUDENT_SERVICE = """public class StudentService {
+    public Student getStudentById(int id) {
+        for (int i = 0; i < students.size() - 1; i++) {
+            if (students.get(i).getId() == id) {
+                return students.get(i);
+            }
+        }
+        return null;
+    }
+
+    public double calculateAverage() {
+        double total = 0;
+
+        for (Student student : students) {
+            total += student.getMarks();
+        }
+
+        return total / students.size();
+    }
+
+    public List<Student> getTopStudents(double cutoff) {
+        List<Student> result = new ArrayList<>();
+
+        for (Student student : students) {
+            if (student.getMarks() > cutoff) {
+                result.add(student);
+            }
+        }
+
+        Collections.sort(result, (a, b) ->
+            (int) (b.getMarks() - a.getMarks())
+        );
+
+        return result;
+    }
+}""".splitlines()
+
+# The dummy_repo issue: four symptoms, and "student"/"marks" on nearly every line.
+STUDENT_ISSUE = """Bug: Student Service Returns Incorrect Results
+Several methods in StudentService produce incorrect results due to boundary conditions, missing validation,
+and incorrect sorting logic. Add three students with IDs 101, 102, and 103. Attempt to retrieve or delete the
+student with ID 103. Calculate the average when the student list is empty. Add students with marks 85.5 and
+85.9 and retrieve the top students. The last student is skipped during lookup. Average calculation divides by
+zero when no students exist. The sorting comparator can treat students with different marks as equal."""
+
+
+@pytest.mark.parametrize(
+    ("method", "buggy_line"),
+    [
+        ("getStudentById", "for (int i = 0; i < students.size() - 1; i++) {"),
+        ("calculateAverage", "return total / students.size();"),
+        ("getTopStudents", "(int) (b.getMarks() - a.getMarks())"),
+    ],
+)
+def test_fault_localization_puts_the_buggy_line_first(method, buggy_line):
+    start = next(i for i, line in enumerate(STUDENT_SERVICE) if f" {method}(" in line) + 1
+    end = next(i for i in range(start, len(STUDENT_SERVICE)) if STUDENT_SERVICE[i] == "    }")
+
+    ranked = adapters._suspicious_lines(STUDENT_SERVICE, start, end, STUDENT_ISSUE)
+
+    assert STUDENT_SERVICE[ranked[0]].strip() == buggy_line
+
+
+def test_a_reported_division_by_zero_tries_a_guard_at_the_top_of_the_body_first(tmp_path, monkeypatch):
+    (tmp_path / "Student.java").write_text("\n".join(STUDENT_SERVICE) + "\n", encoding="utf-8")
+    sent = []
+
+    def fake_urlopen(request, timeout):
+        sent.append(json.loads(request.data)["prompt"])
+        # The reply the Colab endpoint gave for this prompt.
+        return io.BytesIO(json.dumps({"repair": "if (students.size() == 0) {\n            return 0;\n        }\n</s>"}).encode())
+
+    monkeypatch.setattr(adapters.urllib.request, "urlopen", fake_urlopen)
+    start = next(i for i, line in enumerate(STUDENT_SERVICE, 1) if " calculateAverage(" in line)
+    chunk = {"file": "Student.java", "name": "calculateAverage", "type": "method", "language": "java",
+             "start_line": start, "end_line": start + 8, "code": ""}
+
+    patch = adapters.remote_patch(str(tmp_path), [chunk], issue=STUDENT_ISSUE)
+
+    assert sent[0] == (
+        "Repair the bug in this Java code.\nReturn only the missing code.\n\n"
+        "    public double calculateAverage() {\n"
+        "        <FILL_ME>\n"
+        "        double total = 0;\n"
+        "\n"
+        "        for (Student student : students) {\n"
+        "            total += student.getMarks();\n"
+        "        }\n"
+        "\n"
+        "        return total / students.size();\n"
+        "    }"
+    )
+    assert "     public double calculateAverage() {\n" \
+           "+        if (students.size() == 0) {\n+            return 0;\n+        }\n" \
+           "         double total = 0;\n" in patch
+    subprocess.run(["git", "apply", "--check", "-"], cwd=tmp_path, input=patch, text=True, check=True)
+
+
+def test_a_vague_validation_issue_on_a_dividing_method_tries_the_guard_first():
+    # The issue from the UI run that never tried a guard.
+    issue = ("Bug: The Average calculation has bug\n\n"
+             "Add the validation for calculating the average for student service. It raises exception.")
+    start = next(i for i, line in enumerate(STUDENT_SERVICE) if " calculateAverage(" in line)
+
+    sites = adapters._repair_sites(STUDENT_SERVICE, start, start + 1, start + 8, issue)
+
+    assert sites[0] == (start + 1, start + 1)  # before "double total = 0;"
+    assert adapters._symptom_sentence(issue, "return total / students.size();") == (
+        "Add the validation for calculating the average for student service."
+    )
+
+
+def test_a_wrong_line_still_comes_before_a_guard_for_invalid_input():
+    start = next(i for i, line in enumerate(STUDENT_SERVICE) if " getStudentById(" in line)
+    end = start + 7  # the body; the method's "}" is not part of it
+
+    sites = adapters._repair_sites(STUDENT_SERVICE, start, start + 1, end, STUDENT_ISSUE)
+
+    assert STUDENT_SERVICE[sites[0][0]].strip().startswith("for (int i = 0; i < students.size() - 1")
+    assert (start + 1, start + 1) in sites[:3]  # the guard is still among the first tries
+
+
+def test_the_prompt_names_the_symptom_of_the_chosen_line():
+    line = "        return total / students.size();"
+
+    # The sentence is wrapped across two lines in the issue, and an earlier one
+    # ("Calculate the average when the student list is empty.") matches less.
+    assert adapters._symptom_sentence(STUDENT_ISSUE, line) == "Average calculation divides by zero when no students exist."
+    assert adapters._symptom_sentence("Something is wrong.", line) == ""
+    prompt = adapters._ir4([line], 0, 0, 1, 1, "Student.java", "java", issue="Average divides by zero.")
+    assert prompt.startswith("Repair the bug in this Java code: average divides by zero.\nReturn only the missing code.\n")
 
 
 def test_the_function_mode_repairs_a_java_method(tmp_path, monkeypatch):

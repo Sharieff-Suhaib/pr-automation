@@ -782,42 +782,45 @@ def remote_patch(
             f"total_lines={len(lines)}"
         )
 
-    candidates = _suspicious_lines(lines, start, end, issue)
-    if not candidates:
+    sites = _repair_sites(lines, head, start, end, issue)
+    if not sites:
         raise PatchGenerationError(
             f"{target.get('name', 'The function')} in {file_path} has no statement to repair."
         )
 
-    # One line is commented out per request: the model repairs a single buggy
-    # line reliably, but rewrites (and breaks) a whole commented-out body.
-    # Attempt n of the repair loop starts at the n-th most suspicious line, and
-    # a rejected reply moves on to the next line within the same attempt.
-    first = (max(attempt, 1) - 1) % len(candidates)
-    ordered = candidates[first:] + candidates[:first]
+    # One site per request: the model repairs a single line, or writes a
+    # single missing guard, reliably, but rewrites (and breaks) a whole
+    # commented-out body. Attempt n of the repair loop starts at the n-th most
+    # likely site, and a rejected reply moves on to the next one.
+    first = (max(attempt, 1) - 1) % len(sites)
+    ordered = sites[first:] + sites[:first]
     errors: list[str] = []
-    for line_index in ordered[:REMOTE_LINES_PER_ATTEMPT]:
+    for site_start, site_end in ordered[:REMOTE_LINES_PER_ATTEMPT]:
+        inserting = site_start == site_end
+        where = f"insertion before line {site_start + 1}" if inserting else f"line {site_start + 1}"
         prompt = _ir4(
             lines=lines,
             head=head,
-            start=line_index,
-            end=line_index + 1,
+            start=site_start,
+            end=site_end,
             stop=stop,
             file_path=file_path,
             language=language,
-            issue=issue,
+            # Tested: a guard is written best under the plain instruction.
+            issue="" if inserting else _symptom_sentence(issue, lines[site_start]),
         )
         print(
-            "\n========== REMOTE REPAIR PROMPT ==========\n"
+            f"\n========== REMOTE REPAIR PROMPT ({where}) ==========\n"
             f"{prompt}\n"
             "========== END REMOTE REPAIR PROMPT ==========\n",
             flush=True,
         )
         try:
             reply = _ask_remote_model(prompt, language, file_path, target.get("name", "<unknown>"))
-            return _splice_or2(original, lines, line_index, line_index + 1, reply, file_path, language)
+            return _splice_or2(original, lines, site_start, site_end, reply, file_path, language)
         except PatchGenerationError as error:
-            errors.append(f"line {line_index + 1}: {error}")
-            print(f"Remote repair of line {line_index + 1} rejected: {error}", flush=True)
+            errors.append(f"{where}: {error}")
+            print(f"Remote repair at {where} rejected: {error}", flush=True)
 
     raise PatchGenerationError("Remote model: " + "; ".join(errors))
 
@@ -825,36 +828,133 @@ def remote_patch(
 # Lines tried per repair attempt before giving up on the remote model.
 REMOTE_LINES_PER_ATTEMPT = 3
 
-# (pattern, weight): what makes a line a likely home of the bug.
+_BOUND = re.compile(r"(size\(\)|length\(?\)?|len\([^)]*\))\s*-\s*1|<=\s*[\w.]+\.(size\(\)|length)")
+_DIVISION = re.compile(r"[\w)\]]\s*/\s*[\w(]")
+_TRUNCATING_COMPARE = re.compile(r"\(int\)\s*\(|\bcompar|\bsort")
+_NULL = re.compile(r"\bnull\b|\bNone\b")
+_ORDERING = re.compile(r"\s(<|>|<=|>=)\s")  # spaced, so not generics
+
+# (pattern, weight): code shapes where bugs often live, whatever the issue says.
 _BUG_PATTERNS = (
-    (re.compile(r"(size\(\)|length\(?\)?|len\([^)]*\))\s*-\s*1"), 3.0),  # off-by-one bound
-    (re.compile(r"<=\s*[\w.]+\.(size\(\)|length)"), 3.0),  # <= size()/length
+    (_BOUND, 3.0),  # off-by-one bound
     (re.compile(r"\(int\)\s*\("), 2.0),  # truncating cast, e.g. in a comparator
-    (re.compile(r"[\w)\]]\s*/\s*[\w(]"), 1.5),  # division: divide by zero
+    (_DIVISION, 1.5),  # divide by zero
     (re.compile(r"\b(for|while)\b"), 1.0),
     (re.compile(r"\bif\b|\?"), 1.0),
-    (re.compile(r"\s(<|>|<=|>=|==|!=)\s"), 0.5),  # a comparison (spaced, so not generics)
+    (re.compile(r"\s(<|>|<=|>=|==|!=)\s"), 0.5),
 )
+
+# (symptom in the issue, the kind of line that causes it). A described symptom
+# outweighs every generic pattern, so the line the issue points at goes first.
+_SYMPTOMS = (
+    (re.compile(r"divi(de|sion|ded)|by zero|\bzero\b|\bempty\b|average|\bmean\b|\bnan\b|infinit"), _DIVISION),
+    (re.compile(r"\blast\b|\bfirst\b|skip|boundar|off.by.one|out of (range|bounds)"), _BOUND),
+    (re.compile(r"sort|compar|precision|rank|descending|ascending"), _TRUNCATING_COMPARE),
+    (re.compile(r"\bnull\b|\bnone\b|not found|nullpointer"), _NULL),
+    (re.compile(r"threshold|exactly|at least|at most|cutoff|limit"), _ORDERING),
+)
+_SYMPTOM_WEIGHT = 4.0
 _NOT_A_STATEMENT = re.compile(r"^(\}|\{|\};?|\} *else *\{|@\w+.*|//.*|#.*|/\*.*|\*.*|\"\"\".*|'''.*)$")
 
 
-def _suspicious_lines(lines: list[str], start: int, end: int, issue: str = "") -> list[int]:
+def _suspicious_lines(lines: list[str], start: int, end: int, issue: str = "", with_scores: bool = False) -> list:
     """Indices in lines[start:end] that hold code, most likely buggy first.
 
-    Bug patterns (off-by-one bounds, divisions, truncating casts, conditions)
-    plus words shared with the issue; ties keep source order.
+    1. symptoms the issue describes, mapped to the code that causes them
+       ("divides by zero" -> a division, "last one skipped" -> a loop bound)
+    2. generic bug shapes (off-by-one bounds, truncating casts, conditions)
+    3. words shared with the issue, capped: an issue about students mentions
+       "student" on every line of the class, so this only breaks ties
+    Ties keep source order.
     """
-    issue_words = set(re.findall(r"[a-z][a-z0-9]{2,}", issue.lower()))
+    lowered = issue.lower()
+    symptoms = [code_pattern for issue_pattern, code_pattern in _SYMPTOMS if issue_pattern.search(lowered)]
+    issue_words = set(re.findall(r"[a-z][a-z0-9]{2,}", lowered))
     scored = []
     for index in range(start, min(end, len(lines))):
         code = lines[index].strip()
         if not code or _NOT_A_STATEMENT.match(code):
             continue
         words = set(re.findall(r"[a-z][a-z0-9]{2,}", re.sub(r"([a-z])([A-Z])", r"\1 \2", code).lower()))
-        score = sum(weight for pattern, weight in _BUG_PATTERNS if pattern.search(code))
-        score += 0.5 * len(words & issue_words)
+        score = _SYMPTOM_WEIGHT * sum(1 for pattern in symptoms if pattern.search(code))
+        score += sum(weight for pattern, weight in _BUG_PATTERNS if pattern.search(code))
+        score += min(0.25 * len(words & issue_words), 1.0)
         scored.append((-score, index))
-    return [index for _, index in sorted(scored)]
+    return [index for _, index in sorted(scored)] if not with_scores else [(-s, i) for s, i in sorted(scored)]
+
+
+# An issue about a method that divides, worded like this, is about a missing
+# check far more often than about the division itself: "add validation for the
+# average", "it raises an exception", "divides by zero when empty".
+_GUARD_WORDS = re.compile(
+    r"divi(de|sion|ded)|by zero|\bzero\b|\bempty\b|\bnan\b|average|\bmean\b|exception|crash|\berror|"
+    r"validat|invalid|check|guard|handle"
+)
+
+
+def _repair_sites(lines: list[str], head: int, start: int, end: int, issue: str) -> list[tuple[int, int]]:
+    """Where to put <FILL_ME>, most likely first: (i, i + 1) replaces line i,
+    (i, i) inserts before line i -- at the top of the body, for a missing guard.
+
+    The guard goes first when the method divides and the issue talks about a
+    check, an exception, an average or zero. Otherwise it comes right after
+    the lines that strongly match a reported symptom (an off-by-one bound, a
+    named comparator...), so a missing check is always among the first tries.
+    """
+    del head
+    ranked = _suspicious_lines(lines, start, end, issue, with_scores=True)
+    sites = [(index, index + 1) for _, index in ranked]
+    body = _first_statement(lines, start, end)
+    if body is None:
+        return sites
+
+    guard = (body, body)
+    if _GUARD_WORDS.search(issue.lower()) and any(_DIVISION.search(lines[i]) for i in range(start, end)):
+        return [guard, *sites]
+    # With no strong evidence either way, the most suspicious line still goes first.
+    strong = max(sum(1 for score, _ in ranked if score >= _SYMPTOM_WEIGHT), 1)
+    return [*sites[:strong], guard, *sites[strong:]]
+
+
+def _first_statement(lines: list[str], start: int, end: int) -> int | None:
+    """The first line of the body that is code -- after a Python docstring."""
+    index = start
+    while index < end and not lines[index].strip():
+        index += 1
+    if index < end and lines[index].strip()[:3] in ('"""', "'''"):
+        quote, first = lines[index].strip()[:3], lines[index].strip()
+        # A one-line docstring closes on its own line; otherwise find the closing quote.
+        if not (len(first) > 3 and first.endswith(quote)):
+            index += 1
+            while index < end and quote not in lines[index]:
+                index += 1
+        index += 1
+        while index < end and not lines[index].strip():
+            index += 1
+    return index if index < end else None
+
+
+def _symptom_sentence(issue: str, line: str) -> str:
+    """The issue's sentence describing the symptom ``line`` can cause, or "".
+
+    "divides by zero" for a division, "the last one is skipped" for a loop
+    bound. Given in the prompt's first line, it tells the model what to fix;
+    without it the model only knows that something on the line is wrong.
+    """
+    # A single line break is wrapping inside a sentence; a blank line ends one.
+    unwrapped = re.sub(r"(?<!\n)\n(?!\n)", " ", issue)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n{2,}", unwrapped) if s.strip()]
+    # A title ("Bug: The average calculation has bug") names no symptom.
+    sentences = [s for s in sentences if not re.match(r"(bug|issue|fix|feature|problem)\s*:", s, re.I)]
+    for issue_pattern, code_pattern in _SYMPTOMS:
+        if code_pattern.search(line):
+            # The sentence naming the symptom most often, e.g. "divides by zero
+            # when no students exist" over "calculate the average when empty".
+            hits = [(len(issue_pattern.findall(s.lower())), -i, s) for i, s in enumerate(sentences)]
+            best = max(hits, default=(0, 0, ""))
+            if best[0]:
+                return best[2][:200]
+    return ""
 
 
 def _ask_remote_model(prompt: str, language: str, file_path: str, name: str) -> str:
@@ -941,7 +1041,8 @@ def _splice_or2(
 
     # The model often drops the first line's indentation (and the server's
     # decode can strip one space): put it back at the replaced line's indent.
-    indent = next((line[: len(line) - len(line.lstrip())] for line in lines[start:end] if line.strip()), "")
+    # An insertion (start == end) takes the indentation of the line it goes before.
+    indent = next((line[: len(line) - len(line.lstrip())] for line in lines[start : max(end, start + 1)] if line.strip()), "")
     if len(fixed[0]) - len(fixed[0].lstrip()) < len(indent):
         fixed[0] = indent + fixed[0].lstrip()
 
@@ -992,32 +1093,42 @@ def _ir4(
     IR4: the buggy lines stay visible but commented out between markers, and
     `<FILL_ME>` marks where the replacement goes. The model answers with OR2:
     only the replacement lines, which `remote_patch` splices back in place of
-    lines[start:end]. Neither training set had instructions or the issue text
-    in its inputs, so none are added here; `issue` is accepted and unused.
+    lines[start:end].
 
     Java: a two-line instruction, then the RepairLLaMA ir4xor2 format
     (ASSERT-KTH/repairllama-datasets, as in adapters/MegaDiff/test_qlora.py):
     the method alone with its own indentation, "// buggy code" at column 0,
     each buggy line as "// <line>", then <FILL_ME> at the buggy code's
-    indentation and the rest of the method.
+    indentation and the rest of the method. ``issue`` is the one symptom
+    sentence for that line (see `_symptom_sentence`), appended to the first
+    instruction line; "" keeps the instruction plain.
     Python: preprocessor/pythonprocessor.py's make_ir4, scoped to the function
-    (lines[head:stop]) as in the BugsInPy dataset ("# BUGGY CODE", "# <line>").
+    (lines[head:stop]) as in the BugsInPy dataset ("# BUGGY CODE", "# <line>");
+    that training set had no instructions, so ``issue`` is not used.
     """
-    del issue, file_path
+    del file_path
 
     if language == "java":
         region = lines[start:end]
-        indent = next((line[: len(line) - len(line.lstrip())] for line in region if line.strip()), "")
+        # An insertion (start == end) is indented like the line it goes before.
+        indent = next(
+            (line[: len(line) - len(line.lstrip())] for line in lines[start : max(end, start + 1)] if line.strip()), ""
+        )
+        # Nothing is commented out for an insertion: "// buggy code" with no
+        # line under it is not what the tested prompts looked like.
+        marked = ["// buggy code", *(f"// {line}" if line.strip() else "//" for line in region)] if region else []
+        symptom = issue.strip().rstrip(".")
         return "\n".join(
             [
                 # Tested against the Colab adapter: with this header and one
-                # commented-out line it returns just the corrected line.
-                "Repair the bug in this Java code.",
+                # commented-out line it returns just the corrected line, and the
+                # symptom in the first line makes it fix that symptom.
+                f"Repair the bug in this Java code: {symptom[0].lower() + symptom[1:]}." if symptom
+                else "Repair the bug in this Java code.",
                 "Return only the missing code.",
                 "",
                 *lines[head:start],
-                "// buggy code",
-                *(f"// {line}" if line.strip() else "//" for line in region),
+                *marked,
                 f"{indent}<FILL_ME>",
                 *lines[end:stop],
             ]
