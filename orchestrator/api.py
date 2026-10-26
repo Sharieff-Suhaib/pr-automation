@@ -45,39 +45,92 @@ app = FastAPI(
     ),
 )
 
-
 class SolveRequest(BaseModel):
     """One repair request: which repository, and what is wrong with it."""
 
-    repo_url: str = Field(..., description="Repository URL to clone, or a local directory path")
-    issue: str = Field(..., description="The GitHub issue text")
-    top_k: int = Field(5, ge=1, le=20, description="How many code chunks to retrieve")
+    repo_url: str = Field(
+        ...,
+        description=(
+            "Repository URL to clone, or a local directory path"
+        ),
+    )
+
+    issue: str = Field(
+        ...,
+        description="The GitHub issue text",
+    )
+
+    top_k: int = Field(
+        5,
+        ge=1,
+        le=20,
+        description="How many code chunks to retrieve",
+    )
+
     codegen_backend: str = Field(
-        "ollama",
-        description="'ollama' generates a patch with the model; 'stub' replays a fixture diff",
+        "ngrok",
+        description=(
+            "'ngrok' tries the remote repair model first and falls back "
+            "to Ollama; 'stub' replays a fixture diff"
+        ),
     )
-    stub_patch_path: str = Field("", description="Fixture diff, used only when codegen_backend='stub'")
-    reproduce: bool = Field(True, description="Write a test reproducing the issue before patching")
+
+    stub_patch_path: str = Field(
+        "",
+        description=(
+            "Fixture diff, used only when codegen_backend='stub'"
+        ),
+    )
+
+    reproduce: bool = Field(
+        True,
+        description=(
+            "Write a test reproducing the issue before patching"
+        ),
+    )
+
     max_attempts: int = Field(
-        DEFAULT_MAX_ATTEMPTS, ge=1, le=10, description="Patches to try before giving up"
+        DEFAULT_MAX_ATTEMPTS,
+        ge=1,
+        le=10,
+        description=(
+            "Patches to try before giving up"
+        ),
     )
-    isolated_env: bool = Field(True, description="Run tests in a cached venv with the repo's dependencies")
+
+    isolated_env: bool = Field(
+        True,
+        description=(
+            "Run tests in a cached venv with the repo's dependencies"
+        ),
+    )
+
     stub_repro_path: str = Field(
-        "", description="Fixture reproduction test, used only when codegen_backend='stub'"
+        "",
+        description=(
+            "Fixture reproduction test, used only when "
+            "codegen_backend='stub'"
+        ),
     )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "repo_url": "https://github.com/Sharieff-Suhaib/dummy_repo.git",
-                    "issue": "get_user crashes with a KeyError when the username is not registered",
+                    "repo_url": (
+                        "https://github.com/"
+                        "Sharieff-Suhaib/dummy_repo.git"
+                    ),
+                    "issue": (
+                        "get_user crashes with a KeyError "
+                        "when the username is not registered"
+                    ),
                     "top_k": 5,
+                    "codegen_backend": "ngrok",
                 }
             ]
         }
     }
-
 
 class SolveResponse(BaseModel):
     """The report produced by one full pass through the graph."""
@@ -216,19 +269,127 @@ def sample() -> dict[str, Any]:
         "stub_repro_path": str(SAMPLE_REPRO),
     }
 
-
-@app.get("/health", summary="Service and model-backend status")
+@app.get(
+    "/health",
+    summary="Service and model-backend status",
+)
 def health() -> dict[str, Any]:
-    """Report whether the API is up and whether the patch model is reachable."""
-    return {"status": "ok", "ollama": _ollama_status()}
+    """Report API, ngrok, and Ollama availability."""
+
+    return {
+        "status": "ok",
+        "repair_model": _repair_model_status(),
+        "ollama": _ollama_status(),
+    }
+
+
+def _repair_model_status() -> dict[str, Any]:
+    """Probe the remote ngrok repair server."""
+
+    host = adapters.REPAIR_MODEL_URL
+
+    if not host:
+        return {
+            "reachable": False,
+            "host": "",
+            "detail": (
+                "REPAIR_MODEL_URL is not configured"
+            ),
+        }
+
+    # Prefer a normal health endpoint when available.
+    for endpoint in ("/health", "/"):
+        try:
+            with urllib.request.urlopen(
+                f"{host}{endpoint}",
+                timeout=3,
+            ) as response:
+                body = response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            return {
+                "reachable": True,
+                "host": host,
+                "endpoint": endpoint,
+                "response": body[:500],
+            }
+
+        except urllib.error.HTTPError as error:
+            # Try the next endpoint for 404/405 responses.
+            if error.code in (404, 405):
+                continue
+
+            return {
+                "reachable": False,
+                "host": host,
+                "endpoint": endpoint,
+                "detail": f"HTTP {error.code}",
+            }
+
+        except (
+            urllib.error.URLError,
+            OSError,
+            ValueError,
+        ) as error:
+            return {
+                "reachable": False,
+                "host": host,
+                "endpoint": endpoint,
+                "detail": str(error),
+            }
+
+    return {
+        "reachable": False,
+        "host": host,
+        "detail": (
+            "The remote server does not expose /health or /"
+        ),
+    }
 
 
 def _ollama_status() -> dict[str, Any]:
-    """Probe the Ollama host so a failed /solve run is easy to explain."""
+    """Probe Ollama, which is used only as a fallback."""
+
     host = adapters.ollama_host()
+
     try:
-        with urllib.request.urlopen(f"{host}/api/tags", timeout=3) as response:
-            models = json.loads(response.read().decode("utf-8")).get("models", [])
-        return {"reachable": True, "host": host, "models": [model["name"] for model in models]}
-    except (urllib.error.URLError, OSError, ValueError) as error:
-        return {"reachable": False, "host": host, "detail": str(error)}
+        with urllib.request.urlopen(
+            f"{host}/api/tags",
+            timeout=3,
+        ) as response:
+            models = json.loads(
+                response.read().decode("utf-8")
+            ).get("models", [])
+
+        return {
+            "reachable": True,
+            "host": host,
+            "fallback": True,
+            "models": [
+                model.get("name")
+                for model in models
+                if isinstance(model, dict)
+            ],
+        }
+
+    except urllib.error.HTTPError as error:
+        return {
+            "reachable": False,
+            "host": host,
+            "fallback": True,
+            "detail": f"HTTP {error.code}",
+        }
+
+    except (
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+    ) as error:
+        return {
+            "reachable": False,
+            "host": host,
+            "fallback": True,
+            "detail": str(error),
+        }
