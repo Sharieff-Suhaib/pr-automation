@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -423,6 +424,7 @@ def generate_patch(
                     chunks,
                     issue=issue,
                     temperature=remote_temperature,
+                    attempt=attempt,
                 ),
                 "remote-ir4",
             )
@@ -654,9 +656,10 @@ def remote_patch(
     chunks: list[dict[str, Any]],
     issue: str = "",
     temperature: float = 0.0,
+    attempt: int = 1,
 ) -> str:
     """
-    Repair the selected Python or Java function remotely.
+    Repair the selected Python or Java function remotely, one line at a time.
 
     The request format intentionally matches the unchanged Colab client:
 
@@ -779,295 +782,190 @@ def remote_patch(
             f"total_lines={len(lines)}"
         )
 
-    prompt = _ir4(
-        lines=lines,
-        head=head,
-        start=start,
-        end=end,
-        stop=stop,
-        file_path=file_path,
-        language=language,
-        issue=issue,
-    )
+    candidates = _suspicious_lines(lines, start, end, issue)
+    if not candidates:
+        raise PatchGenerationError(
+            f"{target.get('name', 'The function')} in {file_path} has no statement to repair."
+        )
 
-    print(
-        "\n========== REMOTE REPAIR PROMPT ==========\n"
-        f"{prompt}\n"
-        "========== END REMOTE REPAIR PROMPT ==========\n",
-        flush=True,
-    )
+    # One line is commented out per request: the model repairs a single buggy
+    # line reliably, but rewrites (and breaks) a whole commented-out body.
+    # Attempt n of the repair loop starts at the n-th most suspicious line, and
+    # a rejected reply moves on to the next line within the same attempt.
+    first = (max(attempt, 1) - 1) % len(candidates)
+    ordered = candidates[first:] + candidates[:first]
+    errors: list[str] = []
+    for line_index in ordered[:REMOTE_LINES_PER_ATTEMPT]:
+        prompt = _ir4(
+            lines=lines,
+            head=head,
+            start=line_index,
+            end=line_index + 1,
+            stop=stop,
+            file_path=file_path,
+            language=language,
+            issue=issue,
+        )
+        print(
+            "\n========== REMOTE REPAIR PROMPT ==========\n"
+            f"{prompt}\n"
+            "========== END REMOTE REPAIR PROMPT ==========\n",
+            flush=True,
+        )
+        try:
+            reply = _ask_remote_model(prompt, language, file_path, target.get("name", "<unknown>"))
+            return _splice_or2(original, lines, line_index, line_index + 1, reply, file_path, language)
+        except PatchGenerationError as error:
+            errors.append(f"line {line_index + 1}: {error}")
+            print(f"Remote repair of line {line_index + 1} rejected: {error}", flush=True)
 
-    # This payload matches the unchanged Colab code exactly.
-    payload = {
-        "prompt": prompt,
-        "max_new_tokens": min(
-            MAX_PATCH_TOKENS,
-            512,
-        ),
-    }
+    raise PatchGenerationError("Remote model: " + "; ".join(errors))
 
+
+# Lines tried per repair attempt before giving up on the remote model.
+REMOTE_LINES_PER_ATTEMPT = 3
+
+# (pattern, weight): what makes a line a likely home of the bug.
+_BUG_PATTERNS = (
+    (re.compile(r"(size\(\)|length\(?\)?|len\([^)]*\))\s*-\s*1"), 3.0),  # off-by-one bound
+    (re.compile(r"<=\s*[\w.]+\.(size\(\)|length)"), 3.0),  # <= size()/length
+    (re.compile(r"\(int\)\s*\("), 2.0),  # truncating cast, e.g. in a comparator
+    (re.compile(r"[\w)\]]\s*/\s*[\w(]"), 1.5),  # division: divide by zero
+    (re.compile(r"\b(for|while)\b"), 1.0),
+    (re.compile(r"\bif\b|\?"), 1.0),
+    (re.compile(r"\s(<|>|<=|>=|==|!=)\s"), 0.5),  # a comparison (spaced, so not generics)
+)
+_NOT_A_STATEMENT = re.compile(r"^(\}|\{|\};?|\} *else *\{|@\w+.*|//.*|#.*|/\*.*|\*.*|\"\"\".*|'''.*)$")
+
+
+def _suspicious_lines(lines: list[str], start: int, end: int, issue: str = "") -> list[int]:
+    """Indices in lines[start:end] that hold code, most likely buggy first.
+
+    Bug patterns (off-by-one bounds, divisions, truncating casts, conditions)
+    plus words shared with the issue; ties keep source order.
+    """
+    issue_words = set(re.findall(r"[a-z][a-z0-9]{2,}", issue.lower()))
+    scored = []
+    for index in range(start, min(end, len(lines))):
+        code = lines[index].strip()
+        if not code or _NOT_A_STATEMENT.match(code):
+            continue
+        words = set(re.findall(r"[a-z][a-z0-9]{2,}", re.sub(r"([a-z])([A-Z])", r"\1 \2", code).lower()))
+        score = sum(weight for pattern, weight in _BUG_PATTERNS if pattern.search(code))
+        score += 0.5 * len(words & issue_words)
+        scored.append((-score, index))
+    return [index for _, index in sorted(scored)]
+
+
+def _ask_remote_model(prompt: str, language: str, file_path: str, name: str) -> str:
+    """POST one IR4 prompt to the Colab /repair route; return the OR2 text."""
+    from src.agents.coding_agent.code_generator import MAX_PATCH_TOKENS, PatchGenerationError  # noqa: PLC0415
+
+    payload = {"prompt": prompt, "max_new_tokens": min(MAX_PATCH_TOKENS, 512)}
     request = urllib.request.Request(
         f"{REPAIR_MODEL_URL}/repair",
-        data=json.dumps(payload).encode(
-            "utf-8"
-        ),
-        headers={
-            "Content-Type": "application/json",
-            "ngrok-skip-browser-warning": "1",
-        },
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"},
     )
-
-    try:
-        print(
-            f"POST {REPAIR_MODEL_URL}/repair: "
-            f"language={language}, "
-            f"{target.get('name', '<unknown>')} "
-            f"in {file_path}, "
-            f"prompt {len(prompt)} chars, "
-            f"max_new_tokens={payload['max_new_tokens']}; "
-            "waiting for the reply...",
-            flush=True,
-        )
-
-        started = time.monotonic()
-
-        with urllib.request.urlopen(
-            request,
-            timeout=REMOTE_TIMEOUT_SECONDS,
-        ) as response:
-            raw_body = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-        print(
-            "Remote model raw response:",
-            repr(raw_body[:2000]),
-            flush=True,
-        )
-
-        response_data = json.loads(raw_body)
-
-        if isinstance(response_data, str):
-            reply = response_data
-            remote_prompt = prompt
-            remote_generated_text = response_data
-            remote_elapsed_seconds = None
-
-        elif isinstance(response_data, dict):
-            # The unchanged Colab API returns:
-            #
-            # {
-            #     "prompt": "...",
-            #     "repair": "...",
-            #     "generated_text": "...",
-            #     "elapsed_seconds": ...
-            # }
-            reply = response_data.get("repair")
-
-            # Compatibility with alternate response names.
-            if not isinstance(reply, str) or not reply.strip():
-                reply = next(
-                    (
-                        response_data[key]
-                        for key in (
-                            "response",
-                            "generated_text",
-                            "text",
-                            "output",
-                        )
-                        if isinstance(
-                            response_data.get(key),
-                            str,
-                        )
-                    ),
-                    None,
-                )
-
-            if reply is None:
-                raise PatchGenerationError(
-                    "Remote model returned no usable repair. "
-                    f"Response: {response_data!r}"
-                )
-
-            remote_prompt = response_data.get(
-                "prompt",
-                prompt,
-            )
-
-            remote_generated_text = response_data.get(
-                "generated_text",
-                reply,
-            )
-
-            remote_elapsed_seconds = response_data.get(
-                "elapsed_seconds",
-            )
-
-        else:
-            raise PatchGenerationError(
-                "Unexpected remote response type: "
-                f"{type(response_data).__name__}"
-            )
-
-        if not isinstance(reply, str) or not reply.strip():
-            raise PatchGenerationError(
-                "Remote model returned an empty repair."
-            )
-
-        # Store the exact prompt and repair for the UI.
-        LAST_REMOTE_REPAIR.clear()
-        LAST_REMOTE_REPAIR.update(
-            {
-                "prompt": remote_prompt,
-                "repair": reply,
-                "generated_text": remote_generated_text,
-                "elapsed_seconds": remote_elapsed_seconds,
-                "file": file_path,
-                "language": language,
-            }
-        )
-
-        reply = reply.strip()
-
-    except PatchGenerationError:
-        raise
-
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode(
-            "utf-8",
-            errors="replace",
-        )[:500]
-
-        raise PatchGenerationError(
-            f"Remote model returned HTTP {error.code}: {detail}"
-        ) from error
-
-    except (
-        urllib.error.URLError,
-        TimeoutError,
-        ValueError,
-        KeyError,
-        TypeError,
-        OSError,
-    ) as error:
-        raise PatchGenerationError(
-            f"Remote model at {REPAIR_MODEL_URL} failed: {error}"
-        ) from error
-
     print(
-        f"Remote model replied in "
-        f"{time.monotonic() - started:.0f}s: "
-        f"{reply[:500]!r}",
+        f"POST {REPAIR_MODEL_URL}/repair: language={language}, {name} in {file_path}, "
+        f"prompt {len(prompt)} chars, max_new_tokens={payload['max_new_tokens']}; waiting for the reply...",
         flush=True,
     )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=REMOTE_TIMEOUT_SECONDS) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+        print("Remote model raw response:", repr(raw_body[:2000]), flush=True)
+        data = json.loads(raw_body)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+        raise PatchGenerationError(f"Remote model returned HTTP {error.code}: {detail}") from error
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
+        raise PatchGenerationError(f"Remote model at {REPAIR_MODEL_URL} failed: {error}") from error
+
+    if isinstance(data, str):
+        reply = data
+    elif isinstance(data, dict):
+        # The Colab API answers {"repair": ...}; other names are accepted too.
+        reply = next(
+            (data[key] for key in ("repair", "response", "generated_text", "text", "output")
+             if isinstance(data.get(key), str) and data[key].strip()),
+            None,
+        )
+    else:
+        raise PatchGenerationError(f"Unexpected remote response type: {type(data).__name__}")
+    if not reply or not reply.strip():
+        raise PatchGenerationError(f"Remote model returned no usable repair. Response: {data!r}")
+
+    # Stored for the UI: the exact prompt and repair.
+    LAST_REMOTE_REPAIR.clear()
+    LAST_REMOTE_REPAIR.update(
+        {
+            "prompt": data.get("prompt", prompt) if isinstance(data, dict) else prompt,
+            "repair": reply,
+            "generated_text": data.get("generated_text", reply) if isinstance(data, dict) else reply,
+            "elapsed_seconds": data.get("elapsed_seconds") if isinstance(data, dict) else None,
+            "file": file_path,
+            "language": language,
+        }
+    )
+    # The server decodes with special tokens kept: nothing after the
+    # end-of-sequence token "</s>" belongs to the repair. OR2 lines carry their
+    # original indentation, so only the end is stripped.
+    reply = reply.split("</s>")[0].rstrip()
+    print(f"Remote model replied in {time.monotonic() - started:.0f}s: {reply[:500]!r}", flush=True)
+    return reply
+
+
+def _splice_or2(
+    original: str, lines: list[str], start: int, end: int, reply: str, file_path: str, language: str
+) -> str:
+    """Put the OR2 reply in place of lines[start:end], validate, and return the diff."""
+    from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
+    from src.agents.coding_agent.function_patch import make_diff  # noqa: PLC0415
 
     fixed = reply.splitlines()
-
     while fixed and not fixed[0].strip():
         fixed.pop(0)
-
     while fixed and not fixed[-1].strip():
         fixed.pop()
-
     if fixed and fixed[0].strip().startswith("```"):
         fixed.pop(0)
-
     if fixed and fixed[-1].strip() == "```":
         fixed.pop()
-
-    forbidden_markers = {
-        "<FILL_ME>",
-        "<HOLE>",
-        "<PRE>",
-        "<SUF>",
-        "<MID>",
-        "<EOT>",
-    }
-
-    fixed = [
-        line
-        for line in fixed
-        if line.strip() not in forbidden_markers
-    ]
-
+    forbidden_markers = {"<FILL_ME>", "<HOLE>", "<PRE>", "<SUF>", "<MID>", "<EOT>", "</s>"}
+    fixed = [line for line in fixed if line.strip() not in forbidden_markers]
     if not fixed:
-        raise PatchGenerationError(
-            "Remote model returned no usable repair lines."
-        )
+        raise PatchGenerationError("Remote model returned no usable repair lines.")
 
-    expected_indent = next(
-        (
-            len(line) - len(line.lstrip())
-            for line in lines[start:end]
-            if line.strip()
-        ),
-        0,
-    )
+    # The model often drops the first line's indentation (and the server's
+    # decode can strip one space): put it back at the replaced line's indent.
+    indent = next((line[: len(line) - len(line.lstrip())] for line in lines[start:end] if line.strip()), "")
+    if len(fixed[0]) - len(fixed[0].lstrip()) < len(indent):
+        fixed[0] = indent + fixed[0].lstrip()
 
-    first_indent = (
-        len(fixed[0])
-        - len(fixed[0].lstrip())
-    )
-
-    if first_indent == max(
-        expected_indent - 1,
-        0,
-    ):
-        fixed[0] = " " + fixed[0]
-
-    repaired = "\n".join(
-        lines[:start]
-        + fixed
-        + lines[end:]
-    )
-
+    repaired = "\n".join(lines[:start] + fixed + lines[end:])
     if original.endswith("\n"):
         repaired += "\n"
-
     if repaired == original:
-        raise PatchGenerationError(
-            "The remote model returned the function unchanged."
-        )
+        raise PatchGenerationError("The remote model returned the line unchanged.")
 
     if language == "java":
         try:
-            _validate_java_repair(
-                original=original,
-                repaired=repaired,
-                file_path=file_path,
-            )
-
-            _validate_minimal_order_lookup_repair(
-                original=original,
-                repaired=repaired,
-            )
-
+            _validate_java_repair(original=original, repaired=repaired, file_path=file_path)
+            _validate_minimal_order_lookup_repair(original=original, repaired=repaired)
         except AdapterError as error:
-            raise PatchGenerationError(
-                str(error)
-            ) from error
-
+            raise PatchGenerationError(str(error)) from error
     elif language == "python":
         try:
-            compile(
-                repaired,
-                file_path,
-                "exec",
-            )
-
+            compile(repaired, file_path, "exec")
         except SyntaxError as error:
             raise PatchGenerationError(
-                f"The repaired {file_path} is not valid Python: "
-                f"{error.msg} (line {error.lineno})."
+                f"The repaired {file_path} is not valid Python: {error.msg} (line {error.lineno})."
             ) from error
 
-    return make_diff(
-        file_path,
-        original,
-        repaired,
-    )
-
+    return make_diff(file_path, original, repaired)
 
 def get_last_remote_repair() -> dict[str, Any]:
     """
@@ -1089,169 +987,44 @@ def _ir4(
     issue: str = "",
 ) -> str:
     """
-    Build the prompt sent to the unchanged Colab RepairLLaMA API.
+    The IR4 input for lines[start:end], exactly as each adapter was trained.
 
-    IR4 is still used to describe the selected repair region, but the
-    rendered IR4 source is not concatenated with the Java source. This
-    prevents the method from appearing twice in the prompt.
+    IR4: the buggy lines stay visible but commented out between markers, and
+    `<FILL_ME>` marks where the replacement goes. The model answers with OR2:
+    only the replacement lines, which `remote_patch` splices back in place of
+    lines[start:end]. Neither training set had instructions or the issue text
+    in its inputs, so none are added here; `issue` is accepted and unused.
+
+    Java: a two-line instruction, then the RepairLLaMA ir4xor2 format
+    (ASSERT-KTH/repairllama-datasets, as in adapters/MegaDiff/test_qlora.py):
+    the method alone with its own indentation, "// buggy code" at column 0,
+    each buggy line as "// <line>", then <FILL_ME> at the buggy code's
+    indentation and the rest of the method.
+    Python: preprocessor/pythonprocessor.py's make_ir4, scoped to the function
+    (lines[head:stop]) as in the BugsInPy dataset ("# BUGGY CODE", "# <line>").
     """
-
-    issue_text = (
-        issue.strip()
-        or "Repair the reported bug."
-    )
+    del issue, file_path
 
     if language == "java":
-        package = str(
-            PROJECT_ROOT
-            / "src"
-            / "repairLlama"
-            / "src"
-        )
-
-        if package not in sys.path:
-            sys.path.append(package)
-
-        # Keep IR4/or2 region analysis active. This validates and describes
-        # the selected region, but its rendered source is not added to the
-        # model prompt because render_ir4() already contains source context.
-        from repairllama.representation.ir4 import (
-            describe_region,
-            render_ir4,
-        )
-
-        region = describe_region(
-            lines,
-            start + 1,
-            end,
-            file_path=file_path,
-        )
-
-        ir4_representation = render_ir4(
-            lines,
-            region,
-        )
-
-        # Use the actual selected source only once.
-        source_before = lines[head:start]
-        source_region = lines[start:end]
-        source_after = lines[end:stop]
-
-        # Comment the original buggy region, matching the Colab format.
-        commented_buggy_code = [
-            (
-                f"// {line}"
-                if line.strip()
-                else "//"
-            )
-            for line in source_region
-        ]
-
-        prompt_lines = [
-            "Repair the bug in this Java code.",
-            "Return only the missing code.",
-            "",
-            f"// ISSUE: {issue_text}",
-            "",
-            "// REPAIR RULES",
-            "// Make the smallest possible change.",
-            "// Preserve the method signature.",
-            "// Preserve existing variable names.",
-            "// Preserve existing API calls.",
-            "// Preserve existing behavior except for the reported bug.",
-            "// Return only the missing Java code.",
-            "",
-        ]
-
-        # Include only a short IR4 metadata summary, not the full rendered
-        # IR4 source. The full rendered representation duplicates the method.
-        prompt_lines.extend(
+        region = lines[start:end]
+        indent = next((line[: len(line) - len(line.lstrip())] for line in region if line.strip()), "")
+        return "\n".join(
             [
-                "// IR4 REPAIR REGION",
-                (
-                    f"// file: {file_path}; "
-                    f"lines {start + 1}-{end}"
-                ),
+                # Tested against the Colab adapter: with this header and one
+                # commented-out line it returns just the corrected line.
+                "Repair the bug in this Java code.",
+                "Return only the missing code.",
                 "",
-            ]
-        )
-
-        # Add source before the selected region.
-        prompt_lines.extend(source_before)
-
-        # Add exactly one method and exactly one FILL_ME marker.
-        prompt_lines.extend(
-            [
+                *lines[head:start],
                 "// buggy code",
-                *commented_buggy_code,
-                "// end buggy code",
-                "    <FILL_ME>",
+                *(f"// {line}" if line.strip() else "//" for line in region),
+                f"{indent}<FILL_ME>",
+                *lines[end:stop],
             ]
         )
 
-        # Add source after the selected region.
-        prompt_lines.extend(source_after)
-
-        prompt = "\n".join(prompt_lines)
-
-        # Prevent unused-variable warnings while preserving IR4 generation.
-        _ = ir4_representation
-
-        print(
-            "\n========== JAVA IR4 PROMPT ==========\n"
-            f"{prompt}\n"
-            "========== END JAVA IR4 PROMPT ==========\n",
-            flush=True,
-        )
-
-        return prompt
-
-    # Python prompt.
-    source_before = lines[head:start]
-    source_region = lines[start:end]
-    source_after = lines[end:stop]
-
-    commented_buggy_code = [
-        (
-            f"# {line}"
-            if line.strip()
-            else "#"
-        )
-        for line in source_region
-    ]
-
-    prompt_lines = [
-        "Repair the bug in this Python code.",
-        "Return only the missing code.",
-        "",
-        f"# ISSUE: {issue_text}",
-        "",
-        "# REPAIR RULES",
-        "# Make the smallest possible change.",
-        "# Preserve the function signature.",
-        "# Preserve existing variable names.",
-        "# Preserve existing API calls.",
-        "# Preserve existing behavior except for the reported bug.",
-        "# Return only the missing Python code.",
-        "",
-        *source_before,
-        "# buggy code",
-        *commented_buggy_code,
-        "# end buggy code",
-        "<FILL_ME>",
-        *source_after,
-    ]
-
-    prompt = "\n".join(prompt_lines)
-
-    print(
-        "\n========== PYTHON IR4 PROMPT ==========\n"
-        f"{prompt}\n"
-        "========== END PYTHON IR4 PROMPT ==========\n",
-        flush=True,
-    )
-
-    return prompt
+    commented = [f"# {line}" if line else "#" for line in lines[start:end]]
+    return "\n".join([*lines[head:start], "# BUGGY CODE", *commented, "<FILL_ME>", *lines[end:stop]])
 
 def _load_stub_patch(
     stub_patch_path: str,
