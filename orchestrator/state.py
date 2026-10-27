@@ -16,7 +16,7 @@ import os
 from typing import Annotated, Any, TypedDict
 
 # Patches to try per issue (the repair retry limit); MAX_REPAIR_ATTEMPTS in the brief.
-DEFAULT_MAX_ATTEMPTS = int(os.environ.get("AGENT_SWE_MAX_REPAIR_ATTEMPTS", "3"))
+DEFAULT_MAX_ATTEMPTS = int(os.environ.get("AGENT_SWE_MAX_REPAIR_ATTEMPTS", "5"))
 
 
 class AgentState(TypedDict, total=False):
@@ -56,6 +56,10 @@ class AgentState(TypedDict, total=False):
     # --- Coding Agent (Member 3) ---
     patch: str
     patch_source: str  # "remote-ir4" | "ollama-function" | "ollama" (model wrote the diff) | "stub" | "none"
+    # The remote model's candidates are tested as they come (search_remote_patch):
+    remote_site: int | None  # the next repair site to ask about; None once all are tried
+    candidates: Annotated[list[dict[str, Any]], operator.add]  # every candidate and its verdict
+    prevalidated: dict[str, Any]  # the chosen candidate's test run, reused by testing_agent
 
     # --- Testing Agent ---
     working_repo: str
@@ -87,7 +91,7 @@ class AgentState(TypedDict, total=False):
     top_k: int
     codegen_backend: str  # "ollama" (default) | "stub"
     stub_patch_path: str  # fixture diff, only read when codegen_backend == "stub"
-    max_attempts: int  # patches to try before giving up (default 3; stub backend: 1)
+    max_attempts: int  # patches to try before giving up (default 5; stub backend: 1)
     reproduce: bool  # write a reproduction test before the patch (default True)
     isolated_env: bool  # build a venv with the repository's dependencies (default True)
     stub_repro_path: str  # fixture test, only read when codegen_backend == "stub"
@@ -122,6 +126,7 @@ def new_state(
         isolated_env=isolated_env,
         attempt=0,
         attempts=[],
+        candidates=[],
         reflections=[],
         status="running",
         trace=[],

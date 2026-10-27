@@ -15,12 +15,14 @@
     reproduction_agent                -> a test that fails on the unpatched code; the baseline run
       |
       v
-    coding_agent          (Member 3)  -> unified diff patch
+    coding_agent          (Member 3)  -> unified diff patch; the remote model's candidates
+      |                                 (one per repair site) are tested as they come,
+      |                                 and the first that solves the issue is kept
       |
       v
     testing_agent                     -> run the suite before and after the patch, compare
       |
-      +--> reflection_agent  not solved: analyse why (LLM, rule-based fallback)
+      +--> reflection_agent  not solved: analyse why (rules; the LLM once the local model takes over)
       |        |
       |        +--> coding_agent  attempts left: retry with the reflection + test feedback
       |        |
@@ -230,6 +232,14 @@ def coding_agent(state: AgentState) -> AgentState:
             trace=[trace_entry("coding_agent", "skipped: no relevant code")],
         )
 
+    searched = _search_remote(state, attempt)
+    if searched["best"]:
+        return searched["update"]
+    # What the search tried stays in the trace before the local model's attempt.
+    searched_update = dict(searched["update"])
+    searched_trace = searched_update.pop("trace", [])
+    searched_errors = searched_update.pop("errors", [])
+
     feedback = state.get("test_feedback", "")
     issue = state.get("issue", "")
     reproduction = state.get("reproduction") or {}
@@ -253,29 +263,110 @@ def coding_agent(state: AgentState) -> AgentState:
             relevant_chunks=relevant_code,
             feedback=feedback,
             attempt=attempt,
+            use_remote=False,
         )
     except AdapterError as error:
         return AgentState(
+            **searched_update,
             patch="",
             patch_source="none",
             patch_error=str(error),
-            errors=[f"coding_agent (attempt {attempt}): {error}"],
-            trace=[trace_entry("coding_agent", f"attempt {attempt} failed", error=str(error))],
+            errors=[*searched_errors, f"coding_agent (attempt {attempt}): {error}"],
+            trace=[*searched_trace, trace_entry("coding_agent", f"attempt {attempt} failed", error=str(error))],
         )
 
     retry_note = " using the previous attempt's feedback" if feedback else ""
-    return AgentState(
+    update = AgentState(
+        **searched_update,
         patch=patch,
         patch_source=source,
         patch_error="",
         trace=[
+            *searched_trace,
             trace_entry(
                 "coding_agent",
                 f"attempt {attempt}: {len(patch.splitlines())}-line patch via {source}{retry_note}",
                 source=source,
-            )
+            ),
         ],
     )
+    if searched_errors:
+        update["errors"] = searched_errors
+    return update
+
+
+def _search_remote(state: AgentState, attempt: int) -> dict:
+    """Try the remote model's candidates, each tested at once (generate and validate).
+
+    Returns {"best": candidate or None, "update": partial state}. Without a
+    best candidate the update still records what was tried, and the local
+    model (which reads the reflection's feedback) writes this attempt's patch.
+    """
+    site = state.get("remote_site", 0)
+    repo_path = state.get("repo_path", "")
+    if site is None or not adapters.REPAIR_MODEL_URL or not repo_path or state.get("codegen_backend") == "stub":
+        return {"best": None, "update": {"remote_site": None, "prevalidated": {}, "trace": []}}
+
+    language = _test_language(state)
+    baseline = state.get("baseline_result") or {}
+    try:
+        if not baseline:
+            baseline = adapters.run_baseline_tests(repo_path, language=language, python=_python(state))
+        searched = adapters.search_remote_patch(
+            repo_path,
+            state.get("relevant_code", []),
+            # The issue alone: the reproduction test's code would skew which lines look buggy.
+            state.get("issue", ""),
+            test=lambda patch: adapters.apply_and_test(
+                repo_path, patch, language=language, baseline=baseline,
+                reproduction=state.get("reproduction"), python=_python(state),
+            ),
+            first_site=site,
+        )
+    except AdapterError as error:
+        return {
+            "best": None,
+            "update": {
+                "remote_site": None,
+                "prevalidated": {},
+                "errors": [f"coding_agent (attempt {attempt}): remote model unusable: {error}"],
+                "trace": [trace_entry("coding_agent", "remote model unusable; using the local model", error=str(error))],
+            },
+        }
+
+    left = searched["next_site"] < searched["sites"]
+    trace = [
+        trace_entry(
+            "coding_agent",
+            f"attempt {attempt} candidate {number} ({row['where']}): {row['status']}",
+            reason=row["reason"],
+        )
+        for number, row in enumerate(searched["candidates"], 1)
+    ]
+    best = searched["best"]
+    update: dict = {
+        "remote_site": searched["next_site"] if left else None,
+        "candidates": [{"attempt": attempt, **row} for row in searched["candidates"]],
+        "baseline_result": baseline,
+        "prevalidated": {},
+        "trace": trace,
+    }
+    if best:
+        update.update(
+            patch=best["patch"],
+            patch_source="remote-ir4",
+            patch_error="",
+            prevalidated={"patch": best["patch"], "result": best["result"]},
+        )
+        update["trace"].append(
+            trace_entry(
+                "coding_agent",
+                f"attempt {attempt}: {best['status']} candidate at {best['where']} "
+                f"(sites {site + 1}-{searched['next_site']} of {searched['sites']}) via remote-ir4",
+                source="remote-ir4",
+            )
+        )
+    return {"best": best, "update": AgentState(**update)}
 
 
 def testing_agent(state: AgentState) -> AgentState:
@@ -319,7 +410,9 @@ def testing_agent(state: AgentState) -> AgentState:
                 summary=f"no patch to apply; baseline {_counts(baseline)}",
             )
         else:
-            result = adapters.apply_and_test(
+            prevalidated = state.get("prevalidated") or {}
+            # The coding agent's search already tested this exact patch.
+            result = prevalidated["result"] if prevalidated.get("patch") == patch else adapters.apply_and_test(
                 repo_path,
                 patch,
                 language=language,
@@ -457,9 +550,14 @@ def reflection_agent(state: AgentState) -> AgentState:
             strategy=state.get("strategy", ""),
             previous_attempts=state.get("attempts", []),
             max_attempts=state.get("max_attempts", 3),
-            # The LLM's guidance is only read by a retry; after the last attempt the
-            # instant rule-based analysis explains the failure in the report.
-            use_llm=state.get("codegen_backend", "ollama") != "stub" and state.get("status") == "running",
+            # The LLM's guidance is only read by the local model's retry. The remote
+            # model's prompt has no room for it, so while repair sites are left, and
+            # after the last attempt, the instant rule-based analysis is used.
+            use_llm=(
+                state.get("codegen_backend", "ollama") != "stub"
+                and state.get("status") == "running"
+                and state.get("remote_site") is None
+            ),
         )
     except AdapterError as error:
         # Without a reflection the retry still has the testing agent's feedback.

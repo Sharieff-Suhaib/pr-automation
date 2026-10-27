@@ -183,6 +183,11 @@ def build_report(state: AgentState) -> dict[str, Any]:
         # One row per patch the retry loop tested; the fields above show the
         # solved attempt, or the best one when none was solved.
         "attempts": state.get("attempts", []),
+        # Every remote candidate the coding agent tested, and its verdict.
+        "candidates": [
+            {key: row.get(key) for key in ("attempt", "where", "status", "reason", "patch")}
+            for row in state.get("candidates", [])
+        ],
         # The Reflection Agent's analysis of the last failed attempt, and of every one.
         "reflection": state.get("reflection") or {},
         "reflections": state.get("reflections", []),

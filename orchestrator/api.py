@@ -159,6 +159,7 @@ class SolveResponse(BaseModel):
     baseline_result: dict[str, Any] = {}
     test_verdict: dict[str, Any] = {}
     attempts: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     reflection: dict[str, Any] = {}
     reflections: list[dict[str, Any]] = []
     review: dict[str, Any] = {}  # {"pending": True, "thread_id"} until POST /review decides

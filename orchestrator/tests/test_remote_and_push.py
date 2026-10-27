@@ -214,6 +214,29 @@ def test_a_wrong_line_still_comes_before_a_guard_for_invalid_input():
     assert (start + 1, start + 1) in sites[:3]  # the guard is still among the first tries
 
 
+def test_code_quoted_in_the_issue_is_tried_first():
+    # Issue #5 of dummy_repo: the loop and its condition outscore "return true"
+    # on bug shapes, but the issue names that line.
+    trie = [
+        "    public boolean search(String word) {",
+        "        TrieNode node = root;",
+        "        for (char ch : word.toCharArray()) {",
+        "            if (!node.children.containsKey(ch)) {",
+        "                return false;",
+        "            }",
+        "            node = node.children.get(ch);",
+        "        }",
+        "        return true;",
+        "    }",
+    ]
+    issue = ("Trie search bug\n\nIssue: search() returns True for a prefix that is not a complete word.\n"
+             "- Bug location: return true at the end of search().")
+
+    sites = adapters._repair_sites(trie, 0, 1, 9, issue)
+
+    assert sites[0] == (8, 9)
+
+
 def test_the_prompt_names_the_symptom_of_the_chosen_line():
     line = "        return total / students.size();"
 

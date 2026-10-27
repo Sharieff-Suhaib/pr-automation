@@ -27,7 +27,10 @@ from src.agents.reflection_agent.prompts import RETRY_HEADER, SYSTEM_PROMPT, bui
 
 logger = logging.getLogger("agent_swe.reflection")
 
-MAX_REPAIR_ATTEMPTS = int(os.environ.get("AGENT_SWE_MAX_REPAIR_ATTEMPTS", "3"))
+MAX_REPAIR_ATTEMPTS = int(os.environ.get("AGENT_SWE_MAX_REPAIR_ATTEMPTS", "5"))
+# The analysis is a short JSON object; the coding agent's 1024-token budget let
+# the model ramble for a minute on a CPU.
+MAX_REFLECTION_TOKENS = int(os.environ.get("AGENT_SWE_REFLECTION_MAX_TOKENS", "400"))
 
 STATUSES = ("retry", "solved", "max_retries")
 FAILURE_TYPES = (
@@ -143,7 +146,7 @@ class ReflectionAgent:
             return self.llm(prompt)
         from src.agents.coding_agent.code_generator import _call_ollama  # noqa: PLC0415 -- reuse, no new loader
 
-        return _call_ollama(prompt, system=SYSTEM_PROMPT)
+        return _call_ollama(prompt, system=SYSTEM_PROMPT, num_predict=MAX_REFLECTION_TOKENS)
 
 
 def failed_tests(test_results: dict[str, Any]) -> dict[str, str]:

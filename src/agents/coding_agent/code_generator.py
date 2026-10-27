@@ -179,6 +179,7 @@ def _call_ollama(
     model: str = DEFAULT_MODEL,
     system: str = SYSTEM_PROMPT,
     temperature: float = 0,
+    num_predict: int = MAX_PATCH_TOKENS,
 ) -> str:
     """Send one non-streaming request to the local Ollama server."""
     payload = json.dumps(
@@ -188,7 +189,7 @@ def _call_ollama(
             "system": system,
             "stream": False,
             "keep_alive": "30m",  # one run makes many calls; reloading the model costs seconds each time
-            "options": {"temperature": temperature, "num_predict": MAX_PATCH_TOKENS},
+            "options": {"temperature": temperature, "num_predict": num_predict},
         }
     ).encode("utf-8")
     request = urllib.request.Request(

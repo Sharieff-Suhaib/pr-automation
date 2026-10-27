@@ -526,6 +526,16 @@ function render(report) {
         ).join("") +
         "</table></div>"
       : "") +
+    ((report.candidates || []).length
+      ? '<div class="card"><h2>Candidates tested (remote model, one per repair site)</h2><table>' +
+        report.candidates.map((row) =>
+          '<tr><td class="agent">attempt ' + esc(row.attempt) + " &middot; " + esc(row.where) + "</td><td>" +
+            esc(row.status) + " &middot; " + esc(row.reason) +
+            (row.patch ? "<details><summary>patch</summary><pre>" + esc(row.patch) + "</pre></details>" : "") +
+          "</td></tr>"
+        ).join("") +
+        "</table></div>"
+      : "") +
     (report.reflections || []).map((r) =>
       '<div class="card"><h2>Reflection on attempt ' + esc(r.attempt) + "</h2><dl>" +
         "<dt>Status &middot; failure type &middot; source</dt><dd>" + esc(r.status) + " &middot; " +

@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_AGENT_DIR = PROJECT_ROOT / "src" / "agents" / "repository-agent"
@@ -132,6 +132,7 @@ def resolve_repository(repo_url: str) -> str:
     )
 
     _discard_incomplete_clone(repo_url)
+    _update_existing_clone(repo_url)
 
     try:
         print(
@@ -168,6 +169,31 @@ def _discard_incomplete_clone(repo_url: str) -> None:
             destination,
             ignore_errors=True,
         )
+
+
+def _update_existing_clone(repo_url: str) -> None:
+    """Fast-forward an earlier clone, so files pushed since then are indexed.
+
+    clone_repository reuses an existing directory as is. A failed update
+    (offline, local commits, diverged history) keeps the old clone with a
+    warning instead of failing the run.
+    """
+
+    name = repo_url.rstrip("/").split("/")[-1]
+
+    if name.endswith(".git"):
+        name = name[:-4]
+
+    destination = REPOSITORIES_DIR / name
+
+    if not (destination / ".git").exists():
+        return
+
+    try:
+        _git(str(destination), "pull", "--ff-only", "--quiet")
+        print(f"Updated {destination} from its origin.", flush=True)
+    except AdapterError as error:
+        print(f"Could not update {destination}, using it as is: {error}", flush=True)
 
 
 def analyze_repository(
@@ -346,8 +372,13 @@ def generate_patch(
     relevant_chunks: list[dict[str, Any]] | None = None,
     feedback: str = "",
     attempt: int = 1,
+    use_remote: bool = True,
 ) -> tuple[str, str]:
-    """Return a unified diff and its source."""
+    """Return a unified diff and its source.
+
+    `use_remote=False` skips the remote model: the graph's coding agent runs
+    its own search over remote candidates (search_remote_patch) first.
+    """
 
     if backend == "stub":
         return (
@@ -408,7 +439,7 @@ def generate_patch(
 
     remote_error = ""
 
-    if REPAIR_MODEL_URL and repo_path and chunks:
+    if use_remote and REPAIR_MODEL_URL and repo_path and chunks:
         try:
             # The Colab API does not accept or require temperature.
             # Temperature is retained only for local generation paths.
@@ -674,12 +705,118 @@ def remote_patch(
     del temperature
 
     from src.agents.coding_agent.code_generator import (
-        MAX_PATCH_TOKENS,
         PatchGenerationError,
     )
 
-    from src.agents.coding_agent.function_patch import (
-        make_diff,
+    target, sites = _remote_sites(repo_path, chunks, issue)
+
+    # One site per request: the model repairs a single line, or writes a
+    # single missing guard, reliably, but rewrites (and breaks) a whole
+    # commented-out body. Attempt n of the repair loop starts at the n-th most
+    # likely site, and a rejected reply moves on to the next one.
+    first = (max(attempt, 1) - 1) % len(sites)
+    ordered = sites[first:] + sites[:first]
+    errors: list[str] = []
+    for site in ordered[:REMOTE_LINES_PER_ATTEMPT]:
+        try:
+            return _remote_candidate(target, site, issue)
+        except PatchGenerationError as error:
+            errors.append(f"{_site_name(site)}: {error}")
+            print(f"Remote repair at {_site_name(site)} rejected: {error}", flush=True)
+
+    raise PatchGenerationError("Remote model: " + "; ".join(errors))
+
+
+def search_remote_patch(
+    repo_path: str,
+    chunks: list[dict[str, Any]],
+    issue: str,
+    test: Callable[[str], dict[str, Any]],
+    first_site: int = 0,
+    budget: int | None = None,
+) -> dict[str, Any]:
+    """Generate and validate: ask the remote model for one candidate per repair
+    site, test each at once, and stop at the first that solves the issue.
+
+    A call tries up to `budget` sites from `first_site` on, so the next attempt
+    of the repair loop continues where this one stopped instead of asking for
+    the same (deterministic) replies again. Returns the best candidate
+    (`best`, None if every reply was rejected), what each one did
+    (`candidates`), `next_site` and the number of `sites`.
+
+    Raises AdapterError when the endpoint itself cannot be reached.
+    """
+
+    from src.agents.coding_agent.code_generator import (
+        PatchGenerationError,
+    )
+
+    try:
+        target, sites = _remote_sites(repo_path, chunks, issue)
+    except PatchGenerationError as error:
+        raise AdapterError(str(error)) from error
+
+    budget = budget or CANDIDATES_PER_ATTEMPT
+    best: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
+    site_index = first_site
+    while site_index < len(sites) and len(candidates) < budget:
+        site = sites[site_index]
+        site_index += 1
+        where = _site_name(site)
+        try:
+            patch = _remote_candidate(target, site, issue)
+        except PatchGenerationError as error:
+            if str(error).startswith(_REMOTE_DOWN):
+                raise AdapterError(str(error)) from error
+            candidates.append({"where": where, "status": "rejected", "reason": str(error), "patch": ""})
+            print(f"Remote repair at {where} rejected: {error}", flush=True)
+            continue
+
+        result = test(patch)
+        verdict = result["test_verdict"]
+        candidate = {
+            "where": where,
+            "patch": patch,
+            "patch_status": result["patch_status"],
+            "status": verdict["status"],
+            "reason": verdict["reason"],
+            "test_verdict": verdict,
+            "result": result,
+        }
+        candidates.append(candidate)
+        print(f"Candidate at {where}: {verdict['status']} ({verdict['reason']})", flush=True)
+        if is_better_attempt(candidate, best):
+            best = candidate
+        if verdict["status"] == "solved":
+            break
+        # With no test that ran, no other candidate could be told apart from this one.
+        if not (result["test_result"].get("passed") or result["test_result"].get("failed")):
+            break
+
+    return {
+        "best": best,
+        "candidates": [{key: value for key, value in row.items() if key != "result"} for row in candidates],
+        "next_site": site_index,
+        "sites": len(sites),
+    }
+
+
+# Remote replies tested per repair attempt; each comes from another site.
+CANDIDATES_PER_ATTEMPT = int(os.environ.get("AGENT_SWE_CANDIDATES_PER_ATTEMPT", "4"))
+# How _ask_remote_model's messages start when the endpoint, not the reply, failed.
+_REMOTE_DOWN = ("Remote model at ", "Remote model returned HTTP ")
+
+
+def _remote_sites(
+    repo_path: str,
+    chunks: list[dict[str, Any]],
+    issue: str,
+) -> tuple[dict[str, Any], list[tuple[int, int]]]:
+    """The function the remote model repairs, and its repair sites, most likely first."""
+
+    from src.agents.coding_agent.code_generator import (
+        PatchGenerationError,
     )
 
     target = next(
@@ -788,41 +925,49 @@ def remote_patch(
             f"{target.get('name', 'The function')} in {file_path} has no statement to repair."
         )
 
-    # One site per request: the model repairs a single line, or writes a
-    # single missing guard, reliably, but rewrites (and breaks) a whole
-    # commented-out body. Attempt n of the repair loop starts at the n-th most
-    # likely site, and a rejected reply moves on to the next one.
-    first = (max(attempt, 1) - 1) % len(sites)
-    ordered = sites[first:] + sites[:first]
-    errors: list[str] = []
-    for site_start, site_end in ordered[:REMOTE_LINES_PER_ATTEMPT]:
-        inserting = site_start == site_end
-        where = f"insertion before line {site_start + 1}" if inserting else f"line {site_start + 1}"
-        prompt = _ir4(
-            lines=lines,
-            head=head,
-            start=site_start,
-            end=site_end,
-            stop=stop,
-            file_path=file_path,
-            language=language,
-            # Tested: a guard is written best under the plain instruction.
-            issue="" if inserting else _symptom_sentence(issue, lines[site_start]),
-        )
-        print(
-            f"\n========== REMOTE REPAIR PROMPT ({where}) ==========\n"
-            f"{prompt}\n"
-            "========== END REMOTE REPAIR PROMPT ==========\n",
-            flush=True,
-        )
-        try:
-            reply = _ask_remote_model(prompt, language, file_path, target.get("name", "<unknown>"))
-            return _splice_or2(original, lines, site_start, site_end, reply, file_path, language)
-        except PatchGenerationError as error:
-            errors.append(f"{where}: {error}")
-            print(f"Remote repair at {where} rejected: {error}", flush=True)
+    context = {
+        "name": target.get("name", "<unknown>"),
+        "language": language,
+        "file_path": file_path,
+        "original": original,
+        "lines": lines,
+        "head": head,
+        "stop": stop,
+    }
+    return context, sites
 
-    raise PatchGenerationError("Remote model: " + "; ".join(errors))
+
+def _site_name(site: tuple[int, int]) -> str:
+    return f"insertion before line {site[0] + 1}" if site[0] == site[1] else f"line {site[0] + 1}"
+
+
+def _remote_candidate(target: dict[str, Any], site: tuple[int, int], issue: str) -> str:
+    """One IR4 request for one repair site; the reply spliced in as a diff."""
+
+    site_start, site_end = site
+    inserting = site_start == site_end
+    lines = target["lines"]
+    prompt = _ir4(
+        lines=lines,
+        head=target["head"],
+        start=site_start,
+        end=site_end,
+        stop=target["stop"],
+        file_path=target["file_path"],
+        language=target["language"],
+        # Tested: a guard is written best under the plain instruction.
+        issue="" if inserting else _symptom_sentence(issue, lines[site_start]),
+    )
+    print(
+        f"\n========== REMOTE REPAIR PROMPT ({_site_name(site)}) ==========\n"
+        f"{prompt}\n"
+        "========== END REMOTE REPAIR PROMPT ==========\n",
+        flush=True,
+    )
+    reply = _ask_remote_model(prompt, target["language"], target["file_path"], target["name"])
+    return _splice_or2(
+        target["original"], lines, site_start, site_end, reply, target["file_path"], target["language"]
+    )
 
 
 # Lines tried per repair attempt before giving up on the remote model.
@@ -854,29 +999,39 @@ _SYMPTOMS = (
     (re.compile(r"threshold|exactly|at least|at most|cutoff|limit"), _ORDERING),
 )
 _SYMPTOM_WEIGHT = 4.0
+# Code the issue quotes ("Bug location: return true at the end of search()")
+# names the line outright, so it outranks any symptom.
+_QUOTED_CODE_WEIGHT = 2 * _SYMPTOM_WEIGHT
+_CODE_WORD = re.compile(r"[a-z_][a-z0-9_]*")
 _NOT_A_STATEMENT = re.compile(r"^(\}|\{|\};?|\} *else *\{|@\w+.*|//.*|#.*|/\*.*|\*.*|\"\"\".*|'''.*)$")
 
 
 def _suspicious_lines(lines: list[str], start: int, end: int, issue: str = "", with_scores: bool = False) -> list:
     """Indices in lines[start:end] that hold code, most likely buggy first.
 
-    1. symptoms the issue describes, mapped to the code that causes them
+    1. code the issue quotes: two consecutive words of the line, such as
+       "return true", appearing together in the issue
+    2. symptoms the issue describes, mapped to the code that causes them
        ("divides by zero" -> a division, "last one skipped" -> a loop bound)
-    2. generic bug shapes (off-by-one bounds, truncating casts, conditions)
-    3. words shared with the issue, capped: an issue about students mentions
+    3. generic bug shapes (off-by-one bounds, truncating casts, conditions)
+    4. words shared with the issue, capped: an issue about students mentions
        "student" on every line of the class, so this only breaks ties
     Ties keep source order.
     """
     lowered = issue.lower()
     symptoms = [code_pattern for issue_pattern, code_pattern in _SYMPTOMS if issue_pattern.search(lowered)]
     issue_words = set(re.findall(r"[a-z][a-z0-9]{2,}", lowered))
+    issue_sequence = _CODE_WORD.findall(lowered)
+    issue_pairs = set(zip(issue_sequence, issue_sequence[1:]))
     scored = []
     for index in range(start, min(end, len(lines))):
         code = lines[index].strip()
         if not code or _NOT_A_STATEMENT.match(code):
             continue
         words = set(re.findall(r"[a-z][a-z0-9]{2,}", re.sub(r"([a-z])([A-Z])", r"\1 \2", code).lower()))
-        score = _SYMPTOM_WEIGHT * sum(1 for pattern in symptoms if pattern.search(code))
+        code_sequence = _CODE_WORD.findall(re.split(r"\s(//|#)", code)[0].lower())
+        score = _QUOTED_CODE_WEIGHT * bool(issue_pairs & set(zip(code_sequence, code_sequence[1:])))
+        score += _SYMPTOM_WEIGHT * sum(1 for pattern in symptoms if pattern.search(code))
         score += sum(weight for pattern, weight in _BUG_PATTERNS if pattern.search(code))
         score += min(0.25 * len(words & issue_words), 1.0)
         scored.append((-score, index))
@@ -1398,7 +1553,7 @@ def reflect(
     strategy: str = "",
     previous_attempts: list[dict[str, Any]]
     | None = None,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
     use_llm: bool = True,
 ) -> dict[str, Any]:
     """Run the reflection agent on one tested attempt."""

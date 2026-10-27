@@ -66,6 +66,8 @@ def run(tmp_path, monkeypatch):
     shutil.copytree(SAMPLE_REPO, repo)
     monkeypatch.setattr(adapters, "WORKSPACES_DIR", tmp_path / "workspaces")
     monkeypatch.setattr(adapters, "TEST_ENVS_DIR", tmp_path / "test_envs")
+    # No remote model: FakeCoder writes every patch (the remote search has its own tests).
+    monkeypatch.setattr(adapters, "REPAIR_MODEL_URL", "")
     # The Reflection Agent's model: fails, so the rule-based reflection is used.
     monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: "not json")
     monkeypatch.setattr(
@@ -73,7 +75,7 @@ def run(tmp_path, monkeypatch):
         "analyze_repository",
         lambda repo_url, issue, top_k=5: {
             "repo_path": str(repo),
-            "relevant_code": [{"file": "users.py", "name": "get_user", "type": "function",
+            "relevant_code": [{"file": "users.py", "name": "get_user", "type": "function", "language": "python",
                                "start_line": 4, "end_line": 6, "code": "def get_user(users, name): ..."}],
             "relevant_files": ["users.py"],
             "language": "python",
@@ -164,7 +166,7 @@ def test_a_repeated_patch_is_called_out_in_the_feedback(run):
 
 
 def test_when_nothing_solves_the_best_attempt_is_reported(run):
-    report = run(FakeCoder(BREAKS_LOGIN, NO_OP, DOES_NOT_APPLY))
+    report = run(FakeCoder(BREAKS_LOGIN, NO_OP, DOES_NOT_APPLY), max_attempts=3)
 
     assert [row["status"] for row in report["attempts"]] == ["failed", "unverified", "failed"]
     assert report["status"] == "unverified"
@@ -235,3 +237,99 @@ def test_the_stub_backend_never_retries(run):
 
     assert len(report["attempts"]) == 1
     assert report["status"] == "failed"
+
+
+class FakeRemote:
+    """Stands in for the Colab endpoint: one OR2 reply for the replaced line, one for an insertion."""
+
+    def __init__(self, replace: str, insert: str):
+        self.replies = {"replace": replace, "insert": insert}
+        self.sites: list[str] = []
+
+    def __call__(self, request, timeout):
+        import io
+        import json
+
+        prompt = json.loads(request.data)["prompt"]
+        site = "replace" if "#     return users[name]" in prompt else "insert"
+        self.sites.append(site)
+        return io.BytesIO(json.dumps({"repair": self.replies[site] + "\n</s>"}).encode())
+
+
+# Leaves the KeyError for a missing user in place: nothing changes in the tests.
+USELESS = "    return users.get(name, users[name])"
+GUARD = "    if name not in users:\n        return None"
+
+
+@pytest.fixture
+def remote(run, monkeypatch):
+    monkeypatch.setattr(adapters, "REPAIR_MODEL_URL", "http://colab.test")
+
+    def install(replace: str, insert: str) -> FakeRemote:
+        fake = FakeRemote(replace, insert)
+        monkeypatch.setattr(adapters.urllib.request, "urlopen", fake)
+        return fake
+
+    return install
+
+
+def test_remote_candidates_are_tested_until_one_solves_the_issue(run, remote):
+    fake = remote(USELESS, GUARD)
+    coder = FakeCoder()  # the local model is never needed
+
+    report = run(coder)
+
+    assert fake.sites == ["replace", "insert"]  # the return line first, then a guard above it
+    assert [(row["where"], row["status"]) for row in report["candidates"]] == [
+        ("line 6", "unverified"), ("insertion before line 6", "solved"),
+    ]
+    assert report["status"] == "solved" and report["patch_source"] == "remote-ir4"
+    assert "+    if name not in users:" in report["patch"]
+    assert len(report["attempts"]) == 1 and report["reflections"] == [] and coder.feedback == []
+
+
+def test_the_next_attempt_continues_with_the_next_site_and_skips_the_llm_reflection(run, remote, monkeypatch):
+    monkeypatch.setattr(adapters, "CANDIDATES_PER_ATTEMPT", 1)
+    calls = []
+    monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: calls.append(prompt) or "{}")
+    fake = remote(USELESS, GUARD)
+
+    report = run(FakeCoder())
+
+    assert fake.sites == ["replace", "insert"]  # attempt 2 did not ask about line 6 again
+    assert [row["status"] for row in report["attempts"]] == ["unverified", "solved"]
+    # The remote model cannot read the analysis, so the LLM was not asked for one.
+    assert calls == [] and report["reflections"][0]["source"] == "rules"
+
+
+def test_once_every_site_is_tried_the_local_model_takes_over_with_the_llm_reflection(run, remote, monkeypatch):
+    reply = '{"root_cause": "the KeyError is still raised", "repair_guidance": "Return None for a missing name"}'
+    monkeypatch.setattr(adapters, "REFLECTION_LLM", lambda prompt: reply)
+    fake = remote(USELESS, USELESS)
+    coder = FakeCoder(FIX_PATCH)
+
+    report = run(coder)
+
+    assert fake.sites == ["replace", "insert"]  # both sites in attempt 1, none asked twice
+    assert [(row["status"], row["patch_source"]) for row in report["attempts"]] == [
+        ("unverified", "remote-ir4"), ("solved", "ollama-function"),
+    ]
+    assert report["reflections"][0]["source"] == "llm"
+    assert "Root cause: the KeyError is still raised" in coder.feedback[0]
+
+
+def test_an_unreachable_endpoint_falls_back_to_the_local_model(run, remote, monkeypatch):
+    import urllib.error
+
+    remote(USELESS, GUARD)
+
+    def down(request, timeout):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(adapters.urllib.request, "urlopen", down)
+
+    report = run(FakeCoder(FIX_PATCH))
+
+    assert report["status"] == "solved" and report["patch_source"] == "ollama-function"
+    assert report["candidates"] == []
+    assert any("remote model unusable" in entry["summary"] for entry in report["trace"])

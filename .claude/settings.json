@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pytest -q orchestrator/tests src)",
+      "Bash(git stash *)",
+      "Bash(.venv/bin/python -m pytest -q src/repairLlama/tests/model/test_model_loader.py::test_missing_checkpoints_are_not_downloaded \"src/repairLlama/tests/test_structure.py::test_expected_directories_exist[adapters/java-repair]\")"
+    ]
+  }
+}
