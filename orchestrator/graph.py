@@ -467,10 +467,9 @@ def _record_attempt(state: AgentState, outcome: dict, baseline: dict) -> AgentSt
         best = current
 
     # An applied patch with no test that ran cannot be judged, so another attempt
-    # could not be judged either: hand this one to the reviewer instead.
-    untested = current["patch_status"] == "APPLIED" and not (
-        current["test_result"].get("passed") or current["test_result"].get("failed")
-    )
+    # could not be judged either: hand this one to the reviewer instead. A patch
+    # that does not compile ran no test either, but the next one may compile.
+    untested = current["patch_status"] == "APPLIED" and adapters.ran_no_tests(current)
     finished = current["status"] == "solved" or untested or not _can_retry(state, number)
     shown = best if finished else current
     earlier_patches = [row.get("patch", "") for row in state.get("attempts", [])]

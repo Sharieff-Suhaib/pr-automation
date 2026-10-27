@@ -168,6 +168,8 @@ def classify_failure(generated_patch: str, test_results: dict[str, Any]) -> str:
         return "patch_application_error"
     if verdict.get("stage") == "syntax":
         return "syntax_error"
+    if verdict.get("stage") == "compile":
+        return "compilation_error"
     if verdict.get("pass_to_fail"):
         return "regression"
 
@@ -200,7 +202,10 @@ def rule_based_reflection(
         "syntax_error": ("The patched code is not valid Python.",
                          ["Return complete, syntactically valid function definitions."]),
         "compilation_error": (f"No usable patch was produced: {errors[0]}",
-                              ["Return only the corrected functions, as valid Python."]),
+                              ["Return only the corrected functions, as valid Python."])
+        if not generated_patch.strip()
+        else (f"The patched code does not compile: {_first_line(verdict.get('reason', '') or errors[0])}",
+              ["Use only the names (fields, variables, methods) the code already declares."]),
         "patch_application_error": (f"The patch did not apply to the repository: {errors[0]}",
                                     ["Edit the code exactly as shown; do not invent context lines."]),
         "regression": (f"The patch broke behaviour that worked before{evidence}.",

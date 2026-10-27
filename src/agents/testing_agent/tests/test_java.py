@@ -190,3 +190,23 @@ def test_clean_java_test_adds_imports_and_the_package_and_rejects_copies():
     assert "package wrong" not in source
     with pytest.raises(ValueError, match="redefines StudentService"):
         clean_java_test(REPRO + SERVICE, SERVICE)
+
+
+def test_a_patch_that_does_not_compile_is_reported_as_such_not_as_broken_tests(repo, tmp_path):
+    workspaces = tmp_path / "workspaces"
+    writer = tmp_path / "repro.java"
+    writer.write_text(REPRO, encoding="utf-8")
+    reproduction, baseline = prepare_reproduction(
+        repo, "contains() skips the last student", [CHUNK], workspaces, stub_writer(writer), language="java"
+    )
+
+    result = evaluate_patch(
+        repo, FIX.replace("+        for (int i = 0; i < ids.size(); i++) {", "+        for (int i = 0; i < ids.count(); i++) {"),
+        workspaces, language="java", baseline=baseline,
+        extra_files={reproduction["path"]: reproduction["source"]}, reproduction_tests=reproduction["tests"],
+    )
+
+    verdict = result["test_verdict"]
+    assert verdict["stage"] == "compile" and verdict["status"] != "solved"
+    assert verdict["reason"].startswith("The patched code does not compile: javac failed")
+    assert verdict["pass_to_fail"] == []

@@ -3,7 +3,12 @@
     "allow": [
       "Bash(.venv/bin/python -m pytest -q orchestrator/tests src)",
       "Bash(git stash *)",
-      "Bash(.venv/bin/python -m pytest -q src/repairLlama/tests/model/test_model_loader.py::test_missing_checkpoints_are_not_downloaded \"src/repairLlama/tests/test_structure.py::test_expected_directories_exist[adapters/java-repair]\")"
+      "Bash(.venv/bin/python -m pytest -q src/repairLlama/tests/model/test_model_loader.py::test_missing_checkpoints_are_not_downloaded \"src/repairLlama/tests/test_structure.py::test_expected_directories_exist[adapters/java-repair]\")",
+      "Bash(git fetch *)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m pytest -q orchestrator/tests/test_remote_and_push.py -k \"guessed or compile\")",
+      "Bash(.venv/bin/python -m pytest -q orchestrator/tests src/agents)",
+      "Bash(curl -s -m 20 -H \"ngrok-skip-browser-warning: 1\" https://marsupial-abnormal-unselect.ngrok-free.dev/health)"
     ]
   }
 }

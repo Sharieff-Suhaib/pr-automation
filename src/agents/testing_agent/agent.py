@@ -208,6 +208,10 @@ def run_stages(
     if not _uses_pytest(repository, language):
         result = run_suite(repository, python=python, language=language)
         stages.append(_stage("full", result))
+        # javac is the Java compile check: a patch it rejects ran no test, it broke none.
+        compile_error = _javac_error(result)
+        if compile_error and not _javac_error(baseline):
+            return finish(result, not_tested(f"The patched code does not compile: {compile_error}"), "compile")
         return finish(result, compare_runs(baseline, result, reproduction_tests), "full")
 
     if reproduction_files and reproduction_tests:
@@ -295,6 +299,10 @@ def new_workspace(repo_path: str | Path, workspace_root: str | Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return root / f"{Path(repo_path).name}-{stamp}"
+
+
+def _javac_error(result: dict[str, Any] | None) -> str:
+    return next((error for error in (result or {}).get("errors", []) if error.startswith("javac failed")), "")
 
 
 def _skipped(reason: str) -> dict[str, Any]:

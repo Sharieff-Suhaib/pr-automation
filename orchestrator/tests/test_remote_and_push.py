@@ -237,6 +237,71 @@ def test_code_quoted_in_the_issue_is_tried_first():
     assert sites[0] == (8, 9)
 
 
+TRIE = """public class BuggyTrie {
+    private static class TrieNode {
+        Map<Character, TrieNode> children = new HashMap<>();
+        boolean isEnd = false;
+    }
+
+    public boolean search(String word) {
+        TrieNode node = root;
+        for (char ch : word.toCharArray()) {
+            if (!node.children.containsKey(ch)) {
+                return false;
+            }
+            node = node.children.get(ch);
+        }
+        return true;
+    }
+}
+"""
+TRIE_ISSUE = "search() returns true for a prefix. Bug location: return true at the end of search()."
+JAVAC_ISWORD = ("javac failed: BuggyTrie.java:15: error: cannot find symbol\n        return node.isWord;\n"
+                "                   ^\n  symbol:   variable isWord\n  location: variable node of type TrieNode\n1 error")
+
+
+def test_a_guessed_field_name_is_swapped_for_the_closest_declared_member():
+    patch = "--- a/BuggyTrie.java\n+++ b/BuggyTrie.java\n@@ -15 +15 @@\n-        return true;\n+        return node.isWord;\n"
+
+    # As the Java sandbox reports it: a one-line summary in the errors, the rest in the output.
+    summary, details = JAVAC_ISWORD.split("\n", 1)
+    variants = adapters._symbol_variants(patch, TRIE, {"errors": [summary], "output": details})
+
+    # "word" (a parameter) is closer to "isWord", but node.word is no member: isEnd comes first.
+    assert [(wrong, right) for wrong, right, _ in variants][0] == ("isWord", "isEnd")
+    assert ("isWord", "word") not in [(wrong, right) for wrong, right, _ in variants]
+    assert "+        return node.isEnd;\n" in variants[0][2] and "-        return true;\n" in variants[0][2]
+
+
+def test_the_search_repairs_a_name_that_does_not_compile_and_goes_on(tmp_path, monkeypatch):
+    (tmp_path / "BuggyTrie.java").write_text(TRIE, encoding="utf-8")
+    monkeypatch.setattr(
+        adapters.urllib.request, "urlopen",
+        lambda request, timeout: io.BytesIO(json.dumps({"repair": "return node.isWord;\n</s>"}).encode()),
+    )
+    tested = []
+
+    def test(patch):
+        tested.append(patch)
+        if "isWord" in patch:  # what javac says about the model's reply
+            return {"patch_status": "APPLIED", "test_result": {"passed": 0, "failed": 0, "errors": [JAVAC_ISWORD]},
+                    "test_verdict": {"status": "failed", "stage": "compile", "reason": "does not compile",
+                                     "pass_to_fail": [], "fail_to_pass": []}}
+        solved = "+        return node.isEnd;" in patch
+        return {"patch_status": "APPLIED", "test_result": {"passed": 1 + solved, "failed": 1 - solved, "errors": []},
+                "test_verdict": {"status": "solved" if solved else "unverified", "stage": "full", "reason": "",
+                                 "pass_to_fail": [], "fail_to_pass": ["t"] if solved else []}}
+
+    chunk = {"file": "BuggyTrie.java", "name": "search", "type": "method", "language": "java",
+             "start_line": 7, "end_line": 16, "code": ""}
+    searched = adapters.search_remote_patch(str(tmp_path), [chunk], TRIE_ISSUE, test)
+
+    assert [(row["where"], row["status"]) for row in searched["candidates"]] == [
+        ("line 15", "failed"), ("line 15, isWord renamed to isEnd", "solved"),
+    ]
+    assert searched["best"]["status"] == "solved" and searched["next_site"] == 1
+
+
 def test_the_prompt_names_the_symptom_of_the_chosen_line():
     line = "        return total / students.size();"
 

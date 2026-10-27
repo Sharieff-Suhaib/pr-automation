@@ -759,20 +759,11 @@ def search_remote_patch(
     budget = budget or CANDIDATES_PER_ATTEMPT
     best: dict[str, Any] | None = None
     candidates: list[dict[str, Any]] = []
+    asked = 0
     site_index = first_site
-    while site_index < len(sites) and len(candidates) < budget:
-        site = sites[site_index]
-        site_index += 1
-        where = _site_name(site)
-        try:
-            patch = _remote_candidate(target, site, issue)
-        except PatchGenerationError as error:
-            if str(error).startswith(_REMOTE_DOWN):
-                raise AdapterError(str(error)) from error
-            candidates.append({"where": where, "status": "rejected", "reason": str(error), "patch": ""})
-            print(f"Remote repair at {where} rejected: {error}", flush=True)
-            continue
 
+    def run(where: str, patch: str) -> dict[str, Any]:
+        nonlocal best
         result = test(patch)
         verdict = result["test_verdict"]
         candidate = {
@@ -788,10 +779,34 @@ def search_remote_patch(
         print(f"Candidate at {where}: {verdict['status']} ({verdict['reason']})", flush=True)
         if is_better_attempt(candidate, best):
             best = candidate
-        if verdict["status"] == "solved":
+        return result
+
+    while site_index < len(sites) and asked < budget:
+        site = sites[site_index]
+        site_index += 1
+        asked += 1
+        where = _site_name(site)
+        try:
+            patch = _remote_candidate(target, site, issue)
+        except PatchGenerationError as error:
+            if str(error).startswith(_REMOTE_DOWN):
+                raise AdapterError(str(error)) from error
+            candidates.append({"where": where, "status": "rejected", "reason": str(error), "patch": ""})
+            print(f"Remote repair at {where} rejected: {error}", flush=True)
+            continue
+
+        result = run(where, patch)
+        # A name the model guessed (node.isWord for node.isEnd): retry the same
+        # repair with the closest name the file really uses. No model call.
+        if result["test_verdict"].get("stage") == "compile":
+            for wrong, right, renamed in _symbol_variants(patch, target["original"], result["test_result"]):
+                result = run(f"{where}, {wrong} renamed to {right}", renamed)
+                if result["test_verdict"]["status"] == "solved":
+                    break
+        if best and best["status"] == "solved":
             break
         # With no test that ran, no other candidate could be told apart from this one.
-        if not (result["test_result"].get("passed") or result["test_result"].get("failed")):
+        if ran_no_tests(result):
             break
 
     return {
@@ -800,6 +815,64 @@ def search_remote_patch(
         "next_site": site_index,
         "sites": len(sites),
     }
+
+
+def ran_no_tests(result: dict[str, Any]) -> bool:
+    """No test ran on the patched code, and not because it failed to compile:
+    then no other patch could be told apart from this one either."""
+
+    tests = result.get("test_result") or {}
+    if tests.get("passed") or tests.get("failed"):
+        return False
+    return (result.get("test_verdict") or {}).get("stage") not in ("syntax", "compile")
+
+
+# javac: "symbol:   variable isWord" / "symbol:   method isWord(int)".
+_MISSING_SYMBOL = re.compile(r"symbol:\s+(variable|method)\s+([A-Za-z_]\w*)")
+# How alike a guessed name and a real one must be (difflib ratio): isWord/isEnd is 0.55.
+_SYMBOL_SIMILARITY = 0.4
+# "boolean isEnd = false;", "Map<Character, TrieNode> children = ...", "int count;"
+_DECLARED_NAME = re.compile(r"\b[A-Za-z_][\w<>,\[\]]*\s+([A-Za-z_]\w*)\s*(?:=(?!=)|;)")
+
+
+def _symbol_variants(patch: str, original: str, test_result: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """For each name javac cannot find in the patch, the patch with the closest
+    name of the same kind (a variable, or a method) from the original file.
+
+    Returns (wrong, right, patch) triples, at most two per name, closest first.
+    A member access (`node.isWord`) is only matched with names the file uses
+    after a dot, so a field is not swapped for a local variable.
+    """
+
+    import difflib  # noqa: PLC0415
+
+    added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    # The errors keep javac's one-line summary; its "symbol:" lines are in the output.
+    errors = "\n".join([*(str(error) for error in test_result.get("errors", [])), str(test_result.get("output", ""))])
+    variants: list[tuple[str, str, str]] = []
+    for kind, wrong in dict.fromkeys(_MISSING_SYMBOL.findall(errors)):
+        if not re.search(rf"\b{wrong}\b", added):
+            continue
+        call = r"(?=\s*\()" if kind == "method" else r"(?!\s*\()"
+        prefix = r"\.\s*" if re.search(rf"\.\s*{wrong}\b", added) else r"\b"
+        names = set(re.findall(prefix + rf"([A-Za-z_]\w*)\b{call}", original))
+        if kind == "variable":
+            # Declared names too: a field may never be used through a dot ("boolean isEnd = false;").
+            names |= set(_DECLARED_NAME.findall(original))
+        names.discard(wrong)
+        ranked = sorted(
+            ((difflib.SequenceMatcher(None, wrong.lower(), name.lower()).ratio(), name) for name in names),
+            reverse=True,
+        )
+        for score, right in ranked[:2]:
+            if score < _SYMBOL_SIMILARITY:
+                break
+            renamed = "".join(
+                re.sub(rf"\b{wrong}\b", right, line) if line.startswith("+") and not line.startswith("+++") else line
+                for line in patch.splitlines(keepends=True)
+            )
+            variants.append((wrong, right, renamed))
+    return variants
 
 
 # Remote replies tested per repair attempt; each comes from another site.
