@@ -667,7 +667,8 @@ def _not_tested(reason: str) -> dict:
 
 def _logged(node):
     """Print when each agent starts and ends: model calls can run for minutes with no other output."""
-
+    if node == "environment_agent" or node == "reproduction_agent":
+        return
     def run(state: AgentState) -> AgentState:
         print(f"[{node.__name__}] started", flush=True)
         started = time.monotonic()

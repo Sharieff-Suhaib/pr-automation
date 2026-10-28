@@ -390,18 +390,41 @@ async function follow(threadId) {
   }
 }
 
+
 function renderProgress(report, seconds) {
-  const step = (report.current || []).join(", ").replace(/_/g, " ") || "starting";
-  const clock = Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+  const step = (report.current || [])
+    .filter(
+      (agent) =>
+        agent !== "environment_agent" &&
+        agent !== "reproduction_agent"
+    )
+    .join(", ")
+    .replace(/_/g, " ") || "starting";
+
+  const clock =
+    Math.floor(seconds / 60) +
+    ":" +
+    String(seconds % 60).padStart(2, "0");
+
   $("note").textContent = "Running for " + clock;
+
+  const visibleTrace = (report.trace || []).filter(
+    (entry) =>
+      entry.agent !== "environment_agent" &&
+      entry.agent !== "reproduction_agent"
+  );
+
   $("results").innerHTML =
-    '<div class="banner is-skip"><span class="dot pulse"></span><strong>RUNNING</strong>' +
+    '<div class="banner is-skip">' +
+      '<span class="dot pulse"></span><strong>RUNNING</strong>' +
       '<span class="detail">now: ' + esc(step) + " &middot; " + clock +
       " &middot; model calls can take a minute or two each</span></div>" +
     '<div class="card"><h2>Progress</h2><table>' +
-    ((report.trace || []).map((entry) =>
-      '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"
-    ).join("") || '<tr><td class="empty">no agent has finished yet</td></tr>') +
+    (visibleTrace.map((entry) =>
+      '<tr><td class="agent">' + esc(entry.agent) +
+      '</td><td>' + esc(entry.summary) + '</td></tr>'
+    ).join("") ||
+      '<tr><td class="empty">no agent has finished yet</td></tr>') +
     "</table></div>";
 }
 
@@ -548,9 +571,17 @@ function render(report) {
       "</dl></div>"
     ).join("") +
     '<div class="card"><h2>Trace</h2><table>' +
-    (report.trace || []).map((entry) =>
-      '<tr><td class="agent">' + esc(entry.agent) + "</td><td>" + esc(entry.summary) + "</td></tr>"
-    ).join("") +
+    (report.trace || [])
+  .filter(
+    (entry) =>
+      entry.agent !== "environment_agent" &&
+      entry.agent !== "reproduction_agent"
+  )
+  .map((entry) =>
+    '<tr><td class="agent">' + esc(entry.agent) +
+    "</td><td>" + esc(entry.summary) + "</td></tr>"
+  )
+  .join("") +
     "</table></div>";
 
   $("results").innerHTML = html;
