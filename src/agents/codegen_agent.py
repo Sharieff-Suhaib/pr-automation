@@ -86,23 +86,18 @@ def call_ollama(
     system: str = SYSTEM_PROMPT,
     temperature: float = DEFAULT_TEMPERATURE,
     num_predict: int = DEFAULT_NUM_PREDICT,
-    json_mode: bool = False,
 ) -> str:
-    """One non-streaming completion from the local Ollama server.
-
-    ``json_mode`` makes Ollama constrain the reply to valid JSON.
-    """
-    fields = {
-        "model": model,
-        "prompt": prompt,
-        "system": system,
-        "stream": False,
-        "keep_alive": "30m",  # one run makes many calls; reloading the model costs seconds each time
-        "options": {"temperature": temperature, "num_predict": num_predict},
-    }
-    if json_mode:
-        fields["format"] = "json"
-    payload = json.dumps(fields).encode("utf-8")
+    """One non-streaming completion from the local Ollama server."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "system": system,
+            "stream": False,
+            "keep_alive": "30m",  # one run makes many calls; reloading the model costs seconds each time
+            "options": {"temperature": temperature, "num_predict": num_predict},
+        }
+    ).encode("utf-8")
 
     request = urllib.request.Request(
         f"{OLLAMA_HOST}/api/generate",

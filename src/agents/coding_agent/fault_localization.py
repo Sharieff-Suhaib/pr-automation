@@ -1,8 +1,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -45,26 +43,6 @@ FILL_TOKEN = "<FILL_ME>"
 
 DEFAULT_TOP_K = 4
 
-# "ollama" asks the local model which lines are buggy. "heuristic" skips it
-# and scores lines with the rules below, as when Ollama cannot answer.
-LOCALIZER = os.environ.get(
-    "AGENT_SWE_FAULT_LOCALIZER",
-    "ollama",
-).lower()
-
-# Empty: the coding agent's Ollama model.
-LOCALIZER_MODEL = os.environ.get(
-    "AGENT_SWE_LOCALIZER_MODEL",
-    "",
-)
-
-LOCALIZER_SYSTEM_PROMPT = """You are a fault-localization tool.
-You read a bug report and source code with line numbers, and you name the
-line where the buggy code starts and the line where it ends. You never fix
-the code.
-Answer with JSON only, in this shape:
-{"start": <first buggy line>, "end": <last buggy line>}"""
-
 
 # ============================================================================
 # Data structures
@@ -78,10 +56,6 @@ class SuspiciousRegion:
     score: float
     original_code: str
     ir4: str
-
-
-class LocalizationError(RuntimeError):
-    """Ollama could not name a buggy region."""
 
 
 # ============================================================================
@@ -193,288 +167,6 @@ def get_comment_prefix(
         return "<!--"
 
     return "//"
-
-
-# ============================================================================
-# Ollama fault localization
-# ============================================================================
-
-def build_localization_prompt(
-    lines: list[str],
-    ranges: list[tuple[int, int]],
-    issue: str,
-    file_path: str,
-) -> str:
-    """
-    Show the code in `ranges` with its line numbers, under the bug report.
-    """
-
-    width = len(
-        str(
-            max(
-                end
-                for _, end in ranges
-            )
-        )
-    )
-
-    numbered: list[str] = []
-
-    for start, end in ranges:
-        if numbered:
-            numbered.append("...")
-
-        for number in range(
-            start,
-            end + 1,
-        ):
-            numbered.append(
-                f"{number:>{width}} | {lines[number - 1]}"
-            )
-
-    code = "\n".join(numbered)
-
-    report = (
-        issue.strip()
-        or "Not given; find the faulty code."
-    )
-
-    return f"""BUG REPORT:
-{report}
-
-FILE: {file_path}
-{code}
-
-Give the line where the buggy code starts and the line where it ends,
-using the line numbers on the left. A one-line bug has "start" equal to
-"end". When several lines are faulty, "start" is the first of them and
-"end" the last, so the one region covers every bug. Mark only code that
-must change, never a whole function."""
-
-
-def parse_regions(
-    reply: str,
-) -> list[tuple[int, int]]:
-    """
-    Read (start, end) pairs from the model's JSON reply.
-    """
-
-    text = reply.strip()
-
-    match = re.search(
-        r"[\[{].*[\]}]",
-        text,
-        re.DOTALL,
-    )
-
-    try:
-        data = json.loads(
-            match.group(0)
-            if match
-            else text
-        )
-
-    except ValueError as error:
-        raise LocalizationError(
-            f"Ollama did not answer with JSON: {text[:200]!r}"
-        ) from error
-
-    if isinstance(data, dict):
-        data = data.get(
-            "regions",
-            [data],
-        )
-
-    if not isinstance(data, list):
-        return []
-
-    pairs: list[tuple[int, int]] = []
-
-    for item in data:
-        if isinstance(item, dict):
-            start = item.get(
-                "start",
-                item.get("start_line"),
-            )
-
-            end = item.get(
-                "end",
-                item.get(
-                    "end_line",
-                    start,
-                ),
-            )
-
-        elif isinstance(item, (list, tuple)) and item:
-            start, end = item[0], item[-1]
-
-        else:
-            start = end = item
-
-        try:
-            pairs.append(
-                (
-                    int(start),
-                    int(end),
-                )
-            )
-
-        except (TypeError, ValueError):
-            continue
-
-    return pairs
-
-
-def clean_regions(
-    pairs: list[tuple[int, int]],
-    ranges: list[tuple[int, int]],
-    lines: list[str],
-) -> list[tuple[int, int]]:
-    """
-    Keep the regions that start inside `ranges` and hold code, in source
-    order, with overlapping and adjacent regions merged.
-    """
-
-    regions: list[tuple[int, int]] = []
-
-    for start, end in pairs:
-        start, end = min(start, end), max(start, end)
-
-        container = next(
-            (
-                (low, high)
-                for low, high in ranges
-                if low <= start <= high
-            ),
-            None,
-        )
-
-        if container is None:
-            continue
-
-        end = min(
-            end,
-            container[1],
-        )
-
-        has_code = any(
-            line.strip() not in {"", "{", "}"}
-            for line in lines[start - 1:end]
-        )
-
-        if has_code:
-            regions.append(
-                (
-                    start,
-                    end,
-                )
-            )
-
-    merged: list[tuple[int, int]] = []
-
-    for start, end in sorted(regions):
-        if merged and start <= merged[-1][1] + 1:
-            merged[-1] = (
-                merged[-1][0],
-                max(
-                    end,
-                    merged[-1][1],
-                ),
-            )
-        else:
-            merged.append(
-                (
-                    start,
-                    end,
-                )
-            )
-
-    return merged
-
-
-def ollama_localize(
-    lines: list[str],
-    ranges: list[tuple[int, int]],
-    issue: str,
-    file_path: str,
-) -> tuple[int, int]:
-    """
-    Ask Ollama where the bug starts and ends inside `ranges`.
-
-    `ranges` and the result are 1-based, inclusive (start, end) line
-    numbers. The result is one region from the first buggy line to the
-    last, even when Ollama names several. Raises LocalizationError when
-    Ollama is switched off, unreachable, or names no usable line.
-    """
-
-    if LOCALIZER != "ollama":
-        raise LocalizationError(
-            "Ollama fault localization is off "
-            f"(AGENT_SWE_FAULT_LOCALIZER={LOCALIZER})."
-        )
-
-    from src.agents.codegen_agent import (  # noqa: PLC0415
-        DEFAULT_MODEL,
-        OllamaError,
-        call_ollama,
-    )
-
-    prompt = build_localization_prompt(
-        lines=lines,
-        ranges=ranges,
-        issue=issue,
-        file_path=file_path,
-    )
-
-    try:
-        reply = call_ollama(
-            prompt,
-            model=LOCALIZER_MODEL or DEFAULT_MODEL,
-            system=LOCALIZER_SYSTEM_PROMPT,
-            num_predict=200,
-            json_mode=True,
-        )
-
-    except (OllamaError, OSError, ValueError) as error:
-        raise LocalizationError(
-            f"Ollama fault localization failed: {error}"
-        ) from error
-
-    regions = clean_regions(
-        pairs=parse_regions(reply),
-        ranges=ranges,
-        lines=lines,
-    )
-
-    if not regions:
-        raise LocalizationError(
-            "Ollama named no buggy line inside the code: "
-            f"{reply[:200]!r}"
-        )
-
-    # One region from the bug's start to its end; regions in different
-    # functions cannot be one IR4 hole, so the first function's are kept.
-    container = next(
-        (low, high)
-        for low, high in ranges
-        if low <= regions[0][0] <= high
-    )
-
-    start = regions[0][0]
-
-    end = max(
-        last
-        for first, last in regions
-        if container[0] <= first <= container[1]
-    )
-
-    print(
-        f"Ollama localized {file_path}: "
-        f"lines {start}-{end}",
-        flush=True,
-    )
-
-    return start, end
 
 
 # ============================================================================
@@ -937,9 +629,7 @@ def localize_relevant_file(
     relevant_code: list[dict[str, Any]],
 ) -> SuspiciousRegion:
     """
-    Localize one suspicious region and build its IR4 representation:
-    Ollama names where the bug starts and ends, and the heuristic scores
-    pick the region when Ollama cannot.
+    Localize one suspicious region and build its IR4 representation.
     """
 
     actual_path = resolve_file_inside_repository(
@@ -965,38 +655,20 @@ def localize_relevant_file(
         line_count=len(lines),
     )
 
-    try:
-        start_line, end_line = ollama_localize(
-            lines=lines,
-            ranges=allowed_ranges,
-            issue=issue,
+    scores = score_lines(
+        lines=lines,
+        issue=issue,
+        allowed_ranges=allowed_ranges,
+    )
+
+    start_line, end_line, score = (
+        select_suspicious_region(
             file_path=file_path,
-        )
-
-        # Ollama names a region without ranking it.
-        score = 1.0
-
-    except LocalizationError as error:
-        print(
-            f"{error} Using heuristic fault "
-            f"localization for '{file_path}'.",
-            flush=True,
-        )
-
-        scores = score_lines(
             lines=lines,
-            issue=issue,
+            scores=scores,
             allowed_ranges=allowed_ranges,
         )
-
-        start_line, end_line, score = (
-            select_suspicious_region(
-                file_path=file_path,
-                lines=lines,
-                scores=scores,
-                allowed_ranges=allowed_ranges,
-            )
-        )
+    )
 
     original_code = "\n".join(
         lines[

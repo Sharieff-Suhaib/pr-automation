@@ -992,9 +992,7 @@ def _remote_sites(
             f"total_lines={len(lines)}"
         )
 
-    sites = _ollama_sites(lines, head, start, end, stop, issue, file_path, language) or _repair_sites(
-        lines, head, start, end, issue
-    )
+    sites = _repair_sites(lines, head, start, end, issue)
     if not sites:
         raise PatchGenerationError(
             f"{target.get('name', 'The function')} in {file_path} has no statement to repair."
@@ -1010,37 +1008,6 @@ def _remote_sites(
         "stop": stop,
     }
     return context, sites
-
-
-def _ollama_sites(
-    lines: list[str], head: int, start: int, end: int, stop: int, issue: str, file_path: str, language: str
-) -> list[tuple[int, int]]:
-    """The one repair site Ollama names in the function: from the line the
-    bug starts on to the line it ends on, as (i, j), all of it under a
-    single <FILL_ME>. [] when Ollama cannot say, so the caller falls back to
-    the heuristic sites (`_repair_sites`)."""
-    from src.agents.coding_agent.fault_localization import (  # noqa: PLC0415
-        LocalizationError,
-        ollama_localize,
-    )
-
-    try:
-        # Ollama sees the whole function, signature included, by file line number.
-        first, last = ollama_localize(lines, [(head + 1, stop)], issue, file_path)
-    except LocalizationError as error:
-        print(f"{error} Using heuristic repair sites.", flush=True)
-        return []
-    # 1-based inclusive to 0-based half-open, kept inside the body: the
-    # signature (and a Java method's closing brace) is never replaced.
-    site_start, site_end = max(first - 1, start), min(last, end)
-    if language == "java":
-        # A region ending inside a block ("for (...) {" without its "}")
-        # gets a reply that closes it again: end where the blocks close.
-        depth = sum(line.count("{") - line.count("}") for line in lines[site_start:site_end])
-        while depth > 0 and site_end < end:
-            depth += lines[site_end].count("{") - lines[site_end].count("}")
-            site_end += 1
-    return [(site_start, site_end)] if site_start < site_end else []
 
 
 def _site_name(site: tuple[int, ...]) -> str:
