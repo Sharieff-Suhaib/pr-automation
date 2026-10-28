@@ -210,3 +210,159 @@ def test_a_patch_that_does_not_compile_is_reported_as_such_not_as_broken_tests(r
     assert verdict["stage"] == "compile" and verdict["status"] != "solved"
     assert verdict["reason"].startswith("The patched code does not compile: javac failed")
     assert verdict["pass_to_fail"] == []
+
+
+# The dummy_repo file: a method with no class around it.
+LOOSE_METHOD = """public int calculateTotalRevenue(int[] prices, int[] quantities) {
+    int total = 0;
+    for (int i = 0; i <= prices.length; i++) {
+        total += prices[i] - quantities[i];
+    }
+    return total / prices.length;
+}"""
+REVENUE_REPRO = """import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class AgentReproTest {
+    @Test
+    public void testIssueCorrectTotal() {
+        assertEquals(80, new calculateRevenue().calculateTotalRevenue(new int[]{10, 20}, new int[]{2, 3}));
+    }
+}
+"""
+
+
+def test_a_loose_method_compiles_inside_a_class_named_after_its_file(tmp_path):
+    from src.agents.testing_agent.java import as_compiled
+
+    wrapped = as_compiled(LOOSE_METHOD, "calculateRevenue.java")
+    # Same line numbers as the file, so javac errors still point at its lines.
+    assert wrapped.splitlines()[0] == "public class calculateRevenue { " + LOOSE_METHOD.splitlines()[0]
+    assert len(wrapped.splitlines()) == len(LOOSE_METHOD.splitlines()) + 1
+    assert as_compiled(SERVICE, "Student.java") == SERVICE
+
+    (tmp_path / "calculateRevenue.java").write_text(LOOSE_METHOD, encoding="utf-8")
+    (tmp_path / "AgentReproTest.java").write_text(REVENUE_REPRO, encoding="utf-8")
+    before = run_suite(tmp_path)
+    assert (before["passed"], before["failed"]) == (0, 1)  # the index is out of bounds, not a javac error
+
+    fixed = LOOSE_METHOD.replace("<=", "<").replace(" - ", " * ").replace(" / prices.length", "")
+    (tmp_path / "calculateRevenue.java").write_text(fixed, encoding="utf-8")
+    assert run_suite(tmp_path)["status"] == "PASS"
+
+
+def test_two_unrelated_files_declaring_one_class_do_not_stop_the_build(tmp_path):
+    # OrderService.java and E-Commerce.java in dummy_repo each declare `class Product`.
+    (tmp_path / "OrderService.java").write_text(
+        "class Product { int price() { return 1; } }\npublic class OrderService { int total() { return new Product().price(); } }\n"
+    )
+    (tmp_path / "E-Commerce.java").write_text("class Product { int stock() { return 2; } }\n")
+    (tmp_path / "Student.java").write_text(SERVICE)
+    (tmp_path / "AgentReproTest.java").write_text(
+        "import org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.*;\n"
+        "public class AgentReproTest {\n    @Test\n    public void testIssueTotal() { assertEquals(1, new OrderService().total()); }\n}\n"
+    )
+
+    result = run_suite(tmp_path)
+
+    # The test uses OrderService, so its Product is compiled and E-Commerce's is not.
+    assert (result["status"], result["passed"]) == ("PASS", 1)
+
+
+def test_a_loose_array_method_is_reproduced_and_the_correct_repair_solved(tmp_path):
+    # dummy_repo issue #7, with the test codellama:7b wrote for it: a bare call
+    # (no class to call it on) and a guessed total of 20 (the right one is 140).
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "calculateRevenue.java").write_text(LOOSE_METHOD, encoding="utf-8")
+    model_test = (
+        "class AgentReproTest {\n    @Test\n    void testIssue1() {\n"
+        "        int[] prices = {10, 20, 30};\n        int[] quantities = {1, 2, 3};\n"
+        "        assertEquals(20, calculateTotalRevenue(prices, quantities));\n    }\n}\n"
+    )
+    chunk = {"file": "calculateRevenue.java", "name": "calculateTotalRevenue", "type": "method", "language": "java",
+             "start_line": 1, "end_line": 7, "code": ""}
+    workspaces = tmp_path / "ws"
+    issue = "The function of calculate revenue is wrong. Please fix the buggy code which gives the correct total."
+
+    reproduction, baseline = prepare_reproduction(root, issue, [chunk], workspaces, lambda prompt: model_test,
+                                                  language="java")
+
+    # The bare call compiled (it now goes through new calculateRevenue()), but the index
+    # error is no assertion: the built-in check on arrays of one length reproduces it.
+    assert reproduction["status"] == "accepted", reproduction["reason"]
+    assert "new calculateRevenue().calculateTotalRevenue(new int[]{3, 5, 7}, new int[]{3, 5, 7})" in reproduction["source"]
+    patch = (
+        "--- a/calculateRevenue.java\n+++ b/calculateRevenue.java\n@@ -1,7 +1,7 @@\n"
+        " public int calculateTotalRevenue(int[] prices, int[] quantities) {\n     int total = 0;\n"
+        "-    for (int i = 0; i <= prices.length; i++) {\n-        total += prices[i] - quantities[i];\n"
+        "+    for (int i = 0; i < prices.length; i++) {\n+        total += prices[i] * quantities[i];\n"
+        "     }\n-    return total / prices.length;\n+    return total;\n }\n\\ No newline at end of file\n"
+    )
+    result = evaluate_patch(
+        root, patch, workspaces, language="java", baseline=baseline,
+        extra_files={reproduction["path"]: reproduction["source"]}, reproduction_tests=reproduction["tests"],
+    )
+    assert result["test_verdict"]["status"] == "solved", result["test_verdict"]["reason"]
+
+
+# dummy_repo issues #4 and #5, with the tests codellama:7b wrote for them.
+ORDER_SERVICE = '\nimport java.util.*;\n\nclass Product {\n    private int id;\n    private String name;\n    private double price;\n    private int stock;\n\n    public Product(int id, String name, double price, int stock) {\n        this.id = id;\n        this.name = name;\n        this.price = price;\n        this.stock = stock;\n    }\n\n    public int getId() {\n        return id;\n    }\n\n    public String getName() {\n        return name;\n    }\n\n    public double getPrice() {\n        return price;\n    }\n\n    public int getStock() {\n        return stock;\n    }\n\n    public void reduceStock(int quantity) {\n        stock -= quantity;\n    }\n}\n\nclass OrderItem {\n    private Product product;\n    private int quantity;\n\n    public OrderItem(Product product, int quantity) {\n        this.product = product;\n        this.quantity = quantity;\n    }\n\n    public Product getProduct() {\n        return product;\n    }\n\n    public int getQuantity() {\n        return quantity;\n    }\n\n    public double getSubtotal() {\n        return product.getPrice() * quantity;\n    }\n}\n\nclass Order {\n    private int orderId;\n    private List<OrderItem> items;\n    private String status;\n    private double total;\n\n    public Order(int orderId, List<OrderItem> items) {\n        this.orderId = orderId;\n        this.items = items;\n        this.status = "CREATED";\n        this.total = 0;\n    }\n\n    public int getOrderId() {\n        return orderId;\n    }\n\n    public List<OrderItem> getItems() {\n        return items;\n    }\n\n    public String getStatus() {\n        return status;\n    }\n\n    public void setStatus(String status) {\n        this.status = status;\n    }\n\n    public double getTotal() {\n        return total;\n    }\n\n    public void setTotal(double total) {\n        this.total = total;\n    }\n}\n\npublic class OrderService {\n\n    private List<Order> orders = new ArrayList<>();\n\n    public Order createOrder(\n            int orderId, List<OrderItem> items) {\n\n        Order order = new Order(orderId, items);\n\n        for (OrderItem item : items) {\n            Product product = item.getProduct();\n\n            if (product.getStock() >= item.getQuantity()) {\n                product.reduceStock(item.getQuantity());\n            }\n        }\n\n        orders.add(order);\n        return order;\n    }\n\n    public double calculateTotal(Order order) {\n        double total = 0;\n\n        for (OrderItem item : order.getItems()) {\n            total += item.getSubtotal();\n        }\n\n        order.setTotal(total);\n        return total;\n    }\n\n    public boolean cancelOrder(int orderId) {\n        Order order = findOrder(orderId);\n\n        if (order != null) {\n            order.setStatus("CANCELLED");\n            return true;\n        }\n\n        return false;\n    }\n\n    public Order findOrder(int orderId) {\n        for (int i = 0; i < orders.size() - 1; i++) {\n            if (orders.get(i).getOrderId() == orderId) {\n                return orders.get(i);\n            }\n        }\n\n        return null;\n    }\n\n    public List<Order> getOrdersByStatus(String status) {\n        List<Order> result = new ArrayList<>();\n\n        for (Order order : orders) {\n            if (order.getStatus() == status) {\n                result.add(order);\n            }\n        }\n\n        return result;\n    }\n\n    public double applyDiscount(\n            Order order, double discountPercentage) {\n\n        double total = calculateTotal(order);\n        return total - (total * discountPercentage);\n    }\n}\n'
+BUGGY_TRIE = 'import java.util.HashMap;\nimport java.util.Map;\n\npublic class BuggyTrie {\n    private static class TrieNode {\n        Map<Character, TrieNode> children = new HashMap<>();\n        boolean isEnd = false;\n    }\n\n    private final TrieNode root = new TrieNode();\n\n    public void insert(String word) {\n        TrieNode node = root;\n        for (char ch : word.toCharArray()) {\n            node.children.putIfAbsent(ch, new TrieNode());\n            node = node.children.get(ch);\n        }\n        node.isEnd = true;\n    }\n\n    public boolean search(String word) {\n        TrieNode node = root;\n        for (char ch : word.toCharArray()) {\n            if (!node.children.containsKey(ch)) {\n                return false;\n            }\n            node = node.children.get(ch);\n        }\n        return true; // BUG: should return node.isEnd\n    }\n\n    public static void main(String[] args) {\n        BuggyTrie trie = new BuggyTrie();\n        trie.insert("apple");\n\n        System.out.println(trie.search("apple"));\n        System.out.println(trie.search("app")); \n    }\n}'
+
+
+def _solved(tmp_path, file, source, chunk, issue, model_test, old, new):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / file).write_text(source, encoding="utf-8")
+    workspaces = tmp_path / "ws"
+    reproduction, baseline = prepare_reproduction(root, issue, [chunk], workspaces, lambda prompt: model_test,
+                                                  language="java")
+    assert reproduction["status"] == "accepted", reproduction["reason"]
+    from src.agents.coding_agent.function_patch import make_diff
+
+    patch = make_diff(file, source, source.replace(old, new))
+    result = evaluate_patch(
+        root, patch, workspaces, language="java", baseline=baseline,
+        extra_files={reproduction["path"]: reproduction["source"]}, reproduction_tests=reproduction["tests"],
+    )
+    assert result["test_verdict"]["status"] == "solved", result["test_verdict"]["reason"]
+    return reproduction
+
+
+def test_a_lookup_on_an_empty_service_is_replaced_by_the_built_in_last_item_check(tmp_path):
+    # Nothing is ever added, so findOrder returns null before and after any fix.
+    model_test = (
+        "public class AgentReproTest {\n    @Test\n    void testIssue1() {\n"
+        "        Order order = new OrderService().findOrder(1);\n        assertNotNull(order);\n    }\n}\n"
+    )
+    chunk = {"file": "OrderService.java", "name": "findOrder", "type": "method", "language": "java",
+             "start_line": 141, "end_line": 149, "code": ""}
+    issue = ("In OrderService to find a order, it is omitting the last order from the list. Fix the buggy code. "
+             "Changing the loop condition alone would be suffice.")
+
+    reproduction = _solved(tmp_path, "OrderService.java", ORDER_SERVICE, chunk, issue, model_test,
+                           "        for (int i = 0; i < orders.size() - 1; i++) {",
+                           "        for (int i = 0; i < orders.size(); i++) {")
+
+    assert "subject.createOrder(103, new ArrayList<>());" in reproduction["source"]
+
+
+def test_the_test_is_told_the_class_that_holds_the_method_not_a_nested_one(tmp_path):
+    from src.agents.testing_agent.reproduction import build_java_prompt, java_call
+
+    assert java_call(BUGGY_TRIE, "search") == "new BuggyTrie().search"
+    prompt = build_java_prompt("issue", "Trie.java", BUGGY_TRIE, methods=["search"])
+    assert "Call search exactly as `new BuggyTrie().search(...)`." in prompt
+    assert "    public void insert(String word)" in prompt
+    # The test codellama:7b wrote once told the right class.
+    model_test = (
+        "class AgentReproTest {\n    @Test\n    void testIssueSearch() {\n"
+        "        BuggyTrie subject = new BuggyTrie();\n        subject.insert(\"apple\");\n"
+        "        assertFalse(subject.search(\"app\"));\n    }\n}\n"
+    )
+    chunk = {"file": "Trie.java", "name": "search", "type": "method", "language": "java",
+             "start_line": 21, "end_line": 30, "code": ""}
+
+    _solved(tmp_path, "Trie.java", BUGGY_TRIE, chunk, "search() returns True for a prefix.", model_test,
+            "        return true; // BUG: should return node.isEnd", "        return node.isEnd;")

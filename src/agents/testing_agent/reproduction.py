@@ -27,6 +27,7 @@ import re
 from typing import Any, Callable
 
 from src.agents.testing_agent.agent import run_baseline
+from src.agents.testing_agent.java import as_compiled
 from src.agents.testing_agent.junit import FAILED
 
 REPRO_FILE = "test_issue_reproduction.py"
@@ -115,7 +116,8 @@ def prepare_reproduction(
 
     if lang == "java":
         target = chunks[0]["file"]
-        target_source = (repository / target).read_text(encoding="utf-8", errors="replace")
+        # As the sandbox compiles it, so loose methods show the class the test must build.
+        target_source = as_compiled((repository / target).read_text(encoding="utf-8", errors="replace"), target)
         # The method the coding agent repairs (its top-ranked function): every
         # test has to exercise it. Other retrieved methods are context only -- a
         # test of one of them says nothing about the fix, and once it asserted
@@ -140,7 +142,9 @@ def prepare_reproduction(
 
         try:
             if lang == "java":
-                source = drop_guessed_exceptions(keep_tests_calling(clean_java_test(raw, target_source), methods), issue)
+                source = qualify_calls(clean_java_test(raw, target_source), target_source, methods)
+                source = drop_guessed_exceptions(keep_tests_calling(source, methods), issue)
+                source = drop_empty_subject_tests(source, target_source, methods)
             else:
                 source = clean_test_source(raw, chunks, repository)
         except ValueError as error:
@@ -190,7 +194,7 @@ def prepare_reproduction(
         if accepted:
             reproduction.update(
                 status="accepted",
-                reason=f"{reason} (built-in check: empty input must give a finite result, not an exception)",
+                reason=f"{reason} (built-in check, written without the model)",
                 source=source,
                 tests=tests,
                 baseline_outcomes=_repro_only(baseline.get("cases", {})),
@@ -304,6 +308,14 @@ def build_java_prompt(
         "Rules:",
         f"- Declare `public class {JAVA_REPRO_CLASS}` with 1 or 2 methods annotated @Test, each named testIssue<WhatItChecks>.",
         *([f"- Every test must call {' or '.join(methods)}: that is the code the issue is about."] if methods else []),
+        *(
+            f"- Call {method} exactly as `{call}(...)`."
+            for method in methods or []
+            if (call := java_call(target_source, method))
+        ),
+        *_setup_rules(target_source, methods or []),
+        "- Work out each expected value by hand from what the issue asks for, step by step in a comment above the",
+        "  assertion, never from what the code above computes.",
         "- Each test checks ONE concrete symptom the issue describes, with the expected result the issue states.",
         "  Do not assert anything the issue does not say (no guessed exceptions, orders or messages).",
         "- Expect an exception only if the issue says the method SHOULD throw one; valid input must never throw.",
@@ -319,6 +331,26 @@ def build_java_prompt(
     if feedback:
         parts += ["", feedback]
     return "\n".join(parts)
+
+
+def _setup_rules(target_source: str, methods: list[str]) -> list[str]:
+    """Prompt rules naming the class's public methods, for a class with state:
+    the test has to fill the object before the call can show the bug."""
+    for method in methods:
+        call = java_call(target_source, method)
+        if not call or not call.startswith("new "):
+            continue
+        cls = call.removeprefix("new ").split("(")[0]
+        signatures, stateful = _class_api(target_source, cls)
+        # Listing every method, the model called them all; the ones that add data are what it needs.
+        signatures = [s for s in signatures if _ADDER.search(s)] or signatures
+        if stateful:
+            return [
+                f"- {cls} starts empty. In each test: `{cls} subject = new {cls}();`, then add the data the issue",
+                f"  talks about through its methods, then call subject.{method}(...). Its public methods:",
+                *(f"    {signature}" for signature in signatures),
+            ]
+    return []
 
 
 def clean_java_test(raw: str, target_source: str) -> str:
@@ -354,6 +386,112 @@ def clean_java_test(raw: str, target_source: str) -> str:
     if "import java.util.*;" not in source:
         header.append("import java.util.*;")
     return "\n".join([*header, "", source]).strip() + "\n"
+
+
+def java_call(target_source: str, method: str) -> str | None:
+    """How a test calls ``method``: ``Cls.method`` when it is static, else
+    ``new Cls().method`` -- or None when ``new Cls()`` cannot be built."""
+    found = re.search(rf"\b(static\s+)?[\w<>\[\],\s]+?\s+{re.escape(method)}\s*\(", target_source)
+    cls = _enclosing_class(target_source, found.start()) if found else None
+    if not cls:
+        return None
+    if found.group(1):
+        return f"{cls}.{method}"
+    constructors = re.findall(rf"\b{cls}\s*\(([^)]*)\)\s*\{{", target_source)
+    if constructors and all(params.strip() for params in constructors):
+        return None  # every constructor needs arguments
+    return f"new {cls}().{method}"
+
+
+def _class_spans(target_source: str) -> list[tuple[str, int, int]]:
+    """(name, body start, body end) of every class, nested ones included."""
+    spans = []
+    for declared in re.finditer(r"\bclass\s+(\w+)[^{;]*\{", target_source):
+        depth, end = 0, len(target_source)
+        for index in range(declared.end() - 1, len(target_source)):
+            depth += {"{": 1, "}": -1}.get(target_source[index], 0)
+            if depth == 0:
+                end = index
+                break
+        spans.append((declared.group(1), declared.end(), end))
+    return spans
+
+
+def _enclosing_class(target_source: str, position: int) -> str | None:
+    """The innermost class whose body holds ``position`` -- not just the last
+    class declared before it (BuggyTrie's search(), after its nested TrieNode)."""
+    holding = [(start, name) for name, start, end in _class_spans(target_source) if start <= position < end]
+    return max(holding)[1] if holding else None
+
+
+def _class_api(target_source: str, cls: str) -> tuple[list[str], bool]:
+    """The public method signatures of ``cls`` and whether it has instance fields (state)."""
+    span = next(((start, end) for name, start, end in _class_spans(target_source) if name == cls), None)
+    if not span:
+        return [], False
+    body = target_source[span[0] : span[1]]
+    # Only the class's own members: drop nested bodies.
+    while (nested := re.search(r"\{[^{}]*\}", body)) :
+        body = body[: nested.start()] + ";" + body[nested.end() :]
+    signatures = [
+        " ".join(match.group(0).split())
+        for match in re.finditer(r"public\s+(?!class\b|static\s+void\s+main\b)[\w<>\[\], ]+?\s+\w+\s*\([^)]*\)", body)
+    ]
+    stateful = bool(re.search(r"^\s*(?:private|protected|public)?\s*(?:final\s+)?[\w<>\[\], ]+\s+\w+\s*(=[^;]*)?;", body, re.M))
+    return signatures, stateful
+
+
+def drop_empty_subject_tests(source: str, target_source: str, methods: list[str]) -> str:
+    """The test class without tests that query a new, empty object.
+
+    `new OrderService().findOrder(1)` returns null before and after any fix:
+    nothing was ever added, so the test can never show the repair. Only for a
+    class with state (instance fields); `new calculateRevenue().total(...)`
+    needs no setup. Raises ``ValueError`` (a reason the model can act on) when
+    no test is left.
+    """
+    calls = [(method, call) for method in methods if (call := java_call(target_source, method))]
+    stateful_calls = []
+    for method, call in calls:
+        cls = call.split("(")[0].removeprefix("new ").split(".")[0]
+        signatures, stateful = _class_api(target_source, cls)
+        if stateful and call.startswith("new "):
+            setters = {re.search(r"(\w+)\s*\(", s).group(1) for s in signatures} - set(methods)
+            stateful_calls.append((method, cls, setters))
+    if not stateful_calls:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    tests = _java_test_spans(source)
+    empty = []
+    for start, end in tests:
+        body = "".join(lines[start - 1 : end])
+        for method, cls, setters in stateful_calls:
+            subjects = re.findall(rf"(\w+)\s*=\s*new\s+{cls}\s*\(", body)
+            filled = any(re.search(rf"\b{s}\s*\.\s*(\w+)\s*\(", body) and
+                         set(re.findall(rf"\b{s}\s*\.\s*(\w+)\s*\(", body)) & setters for s in subjects)
+            if re.search(rf"\b{method}\s*\(", body) and not filled:
+                empty.append((start, end))
+                break
+    if len(empty) == len(tests):
+        method, cls, setters = stateful_calls[0]
+        raise ValueError(
+            f"Every test calls {method} on a new, empty {cls}, so it fails before and after any fix. "
+            f"Store {cls} in a variable and first add the data the issue describes with "
+            f"{', '.join(sorted(setters)) or 'its methods'}, then call {method}."
+        )
+    return _without_spans(source, empty)
+
+
+def qualify_calls(source: str, target_source: str, methods: list[str]) -> str:
+    """The test with bare calls such as ``calculateTotalRevenue(prices, q)`` --
+    written against a file with no class around the method -- made through its
+    class, as `java_call` says. Calls through an object are left alone."""
+    for method in methods:
+        call = java_call(target_source, method)
+        if call:
+            source = re.sub(rf"(?<![\w.]){re.escape(method)}\s*\(", f"{call}(", source)
+    return source
 
 
 def drop_broken_java_tests(source: str, baseline: dict[str, Any]) -> str | None:
@@ -406,7 +544,16 @@ def java_property_test(issue: str, target_source: str, methods: list[str]) -> st
     these issues describe; the buggy code fails this (0.0 / 0 is NaN, an int
     division throws) and any correct fix passes it. Only for a method without
     arguments returning a number, on a class that `new X()` can build.
+
+    A method taking only numeric arrays gets the same check on arrays of one
+    length, whatever the issue says: valid input must not throw, so a loop
+    running one past the end (`i <= prices.length`) fails it.
     """
+    for method in methods:
+        if source := _java_array_property_test(target_source, method):
+            return source
+        if _LAST_ITEM_SYMPTOM.search(issue.lower()) and (source := _java_lookup_property_test(target_source, method)):
+            return source
     if not _EMPTY_INPUT_SYMPTOM.search(issue.lower()):
         return None
     for method in methods:
@@ -442,6 +589,89 @@ def java_property_test(issue: str, target_source: str, methods: list[str]) -> st
             "}\n"
         )
     return None
+
+
+# A public method that puts data into the object: createOrder(int, List), insert(String)...
+_ADDER = re.compile(r"\s(add|create|insert|put|register|save|append|push)\w*\s*\(", re.I)
+_LAST_ITEM_SYMPTOM = re.compile(r"\blast\b|\bomit|skip|not found|never found|missing|boundar|off.by.one")
+# Values for the parameters an adder may take besides the id.
+_JAVA_DEFAULTS = {
+    "int": "0", "long": "0L", "double": "1.0", "float": "1.0f", "boolean": "true", "String": '"x"',
+    "List": "new ArrayList<>()", "ArrayList": "new ArrayList<>()", "Collection": "new ArrayList<>()",
+    "Set": "new HashSet<>()", "Map": "new HashMap<>()",
+}
+
+
+def _java_lookup_property_test(target_source: str, method: str) -> str | None:
+    """A reproduction test needing no model, for a lookup that skips the last
+    item: add three items through the class's own adder, then look up the
+    last one, which must be found.
+
+    For ``Order findOrder(int orderId)`` next to ``createOrder(int orderId,
+    List<OrderItem> items)``: create orders 101, 102 and 103, and
+    findOrder(103) must not be null. A loop stopping at ``size() - 1`` fails
+    it; any correct fix passes it.
+    """
+    call = java_call(target_source, method)
+    found = re.search(rf"\b(\w+)(?:<[^>]*>)?\s+{re.escape(method)}\s*\(\s*(int|long|String)\s+\w+\s*\)", target_source)
+    if not call or not call.startswith("new ") or not found or found.group(1) in {*_JAVA_DEFAULTS, "void"}:
+        return None
+    cls, id_type = call.removeprefix("new ").split("(")[0], found.group(2)
+    ids = ['"101"', '"102"', '"103"'] if id_type == "String" else ["101", "102", "103"]
+    for signature in _class_api(target_source, cls)[0]:
+        adder = re.search(r"\s(\w+)\s*\(([^)]*)\)$", signature)
+        params = [p.strip() for p in adder.group(2).split(",") if p.strip()] if adder else []
+        types = [re.sub(r"<.*", "", p.rsplit(None, 1)[0]).split()[-1] for p in params]
+        if not _ADDER.search(signature) or not types or types[0] != id_type or not all(t in _JAVA_DEFAULTS for t in types[1:]):
+            continue
+        rest = "".join(f", {_JAVA_DEFAULTS[t]}" for t in types[1:])
+        package = _JAVA_PACKAGE_RE.search(target_source)
+        return (
+            (package.group(0).strip() + "\n" if package else "")
+            + "import java.util.*;\n"
+            "import org.junit.jupiter.api.Test;\n"
+            "import static org.junit.jupiter.api.Assertions.*;\n\n"
+            f"public class {JAVA_REPRO_CLASS} {{\n"
+            "    @Test\n"
+            f"    public void testIssue{method[0].upper() + method[1:]}FindsTheLastOne() {{\n"
+            f"        {cls} subject = new {cls}();\n"
+            + "".join(f"        subject.{adder.group(1)}({item}{rest});\n" for item in ids)
+            + f"        assertNotNull(subject.{method}({ids[-1]}), \"{method}({ids[-1]}) did not find the last one added\");\n"
+            "    }\n"
+            "}\n"
+        )
+    return None
+
+
+def _java_array_property_test(target_source: str, method: str) -> str | None:
+    """`java_property_test` for a method whose parameters are all numeric arrays."""
+    found = re.search(rf"\b(double|float|int|long)\s+{re.escape(method)}\s*\(([^)]*)\)", target_source)
+    call = java_call(target_source, method)
+    if not found or not call or not found.group(2).strip():
+        return None
+    element_types = [re.fullmatch(r"(?:final\s+)?(int|long|double|float)\s*\[\]\s*\w+", p.strip()) for p in found.group(2).split(",")]
+    if not all(element_types):
+        return None
+    arguments = ", ".join(f"new {match.group(1)}[]{{3, 5, 7}}" for match in element_types)
+    floating = found.group(1) in ("double", "float")
+    package = _JAVA_PACKAGE_RE.search(target_source)
+    check = (
+        f"        double result = assertDoesNotThrow(() -> {call}({arguments}));\n"
+        f'        assertFalse(Double.isNaN(result) || Double.isInfinite(result), "{method} returned " + result);\n'
+        if floating
+        else f"        assertDoesNotThrow(() -> {call}({arguments}));\n"
+    )
+    return (
+        (package.group(0).strip() + "\n" if package else "")
+        + "import org.junit.jupiter.api.Test;\n"
+        "import static org.junit.jupiter.api.Assertions.*;\n\n"
+        f"public class {JAVA_REPRO_CLASS} {{\n"
+        "    @Test\n"
+        f"    public void testIssue{method[0].upper() + method[1:]}OnArraysOfOneLength() {{\n"
+        f"{check}"
+        "    }\n"
+        "}\n"
+    )
 
 
 def drop_guessed_exceptions(source: str, issue: str) -> str:

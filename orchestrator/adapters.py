@@ -885,7 +885,7 @@ def _remote_sites(
     repo_path: str,
     chunks: list[dict[str, Any]],
     issue: str,
-) -> tuple[dict[str, Any], list[tuple[int, int]]]:
+) -> tuple[dict[str, Any], list[tuple[int, ...]]]:
     """The function the remote model repairs, and its repair sites, most likely first."""
 
     from src.agents.coding_agent.code_generator import (
@@ -1010,37 +1010,83 @@ def _remote_sites(
     return context, sites
 
 
-def _site_name(site: tuple[int, int]) -> str:
-    return f"insertion before line {site[0] + 1}" if site[0] == site[1] else f"line {site[0] + 1}"
+def _site_name(site: tuple[int, ...]) -> str:
+    if len(site) > 2:
+        return f"lines {', '.join(str(fault + 1) for fault in site[2:])} one at a time"
+    if site[0] == site[1]:
+        return f"insertion before line {site[0] + 1}"
+    return f"line {site[0] + 1}" if site[1] == site[0] + 1 else f"lines {site[0] + 1}-{site[1]}"
 
 
-def _remote_candidate(target: dict[str, Any], site: tuple[int, int], issue: str) -> str:
-    """One IR4 request for one repair site; the reply spliced in as a diff."""
+def _remote_candidate(target: dict[str, Any], site: tuple[int, ...], issue: str) -> str:
+    """One IR4 request for one repair site; the reply spliced in as a diff.
 
+    A multi-fault site, (start, end, *faults), asks once per fault instead.
+    """
+
+    if len(site) > 2:
+        return _remote_candidate_per_fault(target, site[2:], issue)
     site_start, site_end = site
-    inserting = site_start == site_end
     lines = target["lines"]
+    reply = _ask_for_site(target, lines, site_start, site_end, target["stop"], issue, _site_name(site))
+    return _splice_or2(
+        target["original"], lines, site_start, site_end, reply, target["file_path"], target["language"]
+    )
+
+
+def _ask_for_site(
+    target: dict[str, Any], lines: list[str], start: int, end: int, stop: int, issue: str, where: str
+) -> str:
+    """Send the IR4 prompt for lines[start:end] and return the model's OR2 reply."""
     prompt = _ir4(
         lines=lines,
         head=target["head"],
-        start=site_start,
-        end=site_end,
-        stop=target["stop"],
+        start=start,
+        end=end,
+        stop=stop,
         file_path=target["file_path"],
         language=target["language"],
         # Tested: a guard is written best under the plain instruction.
-        issue="" if inserting else _symptom_sentence(issue, lines[site_start]),
+        issue="" if start == end else _symptom_sentence(issue, "\n".join(lines[start:end])),
     )
     print(
-        f"\n========== REMOTE REPAIR PROMPT ({_site_name(site)}) ==========\n"
+        f"\n========== REMOTE REPAIR PROMPT ({where}) ==========\n"
         f"{prompt}\n"
         "========== END REMOTE REPAIR PROMPT ==========\n",
         flush=True,
     )
-    reply = _ask_remote_model(prompt, target["language"], target["file_path"], target["name"])
-    return _splice_or2(
-        target["original"], lines, site_start, site_end, reply, target["file_path"], target["language"]
-    )
+    return _ask_remote_model(prompt, target["language"], target["file_path"], target["name"])
+
+
+def _remote_candidate_per_fault(target: dict[str, Any], faults: tuple[int, ...], issue: str) -> str:
+    """Repair several faults of one method one request at a time, top to bottom,
+    and return them as one diff.
+
+    Shown several commented-out faults at once, the model fixes some and copies
+    the others back unchanged (the loop bound and the division in
+    calculateTotalRevenue, but not `prices[i] - quantities[i]`). Shown one, it
+    fixes that one. Each prompt comments out only its fault line and already
+    holds the repairs of the faults above it. A fault the model returns
+    unchanged is left as it is.
+    """
+    from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
+
+    lines = list(target["lines"])
+    shift = 0  # lines added (or removed) by the repairs above
+    for fault in faults:
+        line = fault + shift
+        where = f"line {fault + 1}, fault {faults.index(fault) + 1} of {len(faults)}"
+        reply = _ask_for_site(target, lines, line, line + 1, target["stop"] + shift, issue, where)
+        fixed = _or2_lines(lines, line, line + 1, reply)
+        lines[line : line + 1] = fixed
+        shift += len(fixed) - 1
+
+    repaired = "\n".join(lines)
+    if target["original"].endswith("\n"):
+        repaired += "\n"
+    if repaired == target["original"]:
+        raise PatchGenerationError("The remote model returned every faulty line unchanged.")
+    return _validated_diff(target["original"], repaired, target["file_path"], target["language"])
 
 
 # Lines tried per repair attempt before giving up on the remote model.
@@ -1048,6 +1094,9 @@ REMOTE_LINES_PER_ATTEMPT = 3
 
 _BOUND = re.compile(r"(size\(\)|length\(?\)?|len\([^)]*\))\s*-\s*1|<=\s*[\w.]+\.(size\(\)|length)")
 _DIVISION = re.compile(r"[\w)\]]\s*/\s*[\w(]")
+# Two values combined with +, -, * or %: a wrong operator (price - quantity for
+# price * quantity). Not "+=", "i++" or "size() - 1", which _BOUND covers.
+_ARITHMETIC = re.compile(r"[\w)\]]\s*(?<![-+*%])[-+*%](?![-+*%=>])\s*[A-Za-z_(]")
 _TRUNCATING_COMPARE = re.compile(r"\(int\)\s*\(|\bcompar|\bsort")
 _NULL = re.compile(r"\bnull\b|\bNone\b")
 _ORDERING = re.compile(r"\s(<|>|<=|>=)\s")  # spaced, so not generics
@@ -1057,6 +1106,7 @@ _BUG_PATTERNS = (
     (_BOUND, 3.0),  # off-by-one bound
     (re.compile(r"\(int\)\s*\("), 2.0),  # truncating cast, e.g. in a comparator
     (_DIVISION, 1.5),  # divide by zero
+    (_ARITHMETIC, 1.5),  # wrong operator
     (re.compile(r"\b(for|while)\b"), 1.0),
     (re.compile(r"\bif\b|\?"), 1.0),
     (re.compile(r"\s(<|>|<=|>=|==|!=)\s"), 0.5),
@@ -1066,8 +1116,9 @@ _BUG_PATTERNS = (
 # outweighs every generic pattern, so the line the issue points at goes first.
 _SYMPTOMS = (
     (re.compile(r"divi(de|sion|ded)|by zero|\bzero\b|\bempty\b|average|\bmean\b|\bnan\b|infinit"), _DIVISION),
-    (re.compile(r"\blast\b|\bfirst\b|skip|boundar|off.by.one|out of (range|bounds)"), _BOUND),
+    (re.compile(r"\blast\b|\bfirst\b|skip|boundar|off.by.one|out ?of ?(range|bounds)"), _BOUND),
     (re.compile(r"sort|compar|precision|rank|descending|ascending"), _TRUNCATING_COMPARE),
+    (re.compile(r"revenue|\btotal\b|\bsum\b|amount|multipl|product|subtract|wrong (value|result)"), _ARITHMETIC),
     (re.compile(r"\bnull\b|\bnone\b|not found|nullpointer"), _NULL),
     (re.compile(r"threshold|exactly|at least|at most|cutoff|limit"), _ORDERING),
 )
@@ -1120,28 +1171,101 @@ _GUARD_WORDS = re.compile(
 )
 
 
-def _repair_sites(lines: list[str], head: int, start: int, end: int, issue: str) -> list[tuple[int, int]]:
-    """Where to put <FILL_ME>, most likely first: (i, i + 1) replaces line i,
-    (i, i) inserts before line i -- at the top of the body, for a missing guard.
+def _repair_sites(lines: list[str], head: int, start: int, end: int, issue: str) -> list[tuple[int, ...]]:
+    """Where to put <FILL_ME>, most likely first: (i, j) replaces lines i..j-1,
+    (i, i) inserts before line i -- at the top of the body, for a missing guard,
+    and (i, j, *faults) repairs each fault in lines i..j-1 in its own request.
 
-    The guard goes first when the method divides and the issue talks about a
-    check, an exception, an average or zero. Otherwise it comes right after
-    the lines that strongly match a reported symptom (an off-by-one bound, a
-    named comparator...), so a missing check is always among the first tries.
+    The guard goes first when the most suspicious line with a bug shape divides
+    (not an off-by-one bound, say) and the issue talks about a check, an
+    exception, an average or zero. Otherwise it comes right after the lines
+    that strongly match a reported symptom (an off-by-one bound, a named
+    comparator...), so a missing check is always among the first tries.
+    Several faults close together (see `_suspicious_hunks`) are tried as one
+    region before any of them alone.
     """
     del head
     ranked = _suspicious_lines(lines, start, end, issue, with_scores=True)
     sites = [(index, index + 1) for _, index in ranked]
     body = _first_statement(lines, start, end)
-    if body is None:
-        return sites
+    if body is not None:
+        guard = (body, body)
+        shaped = next((i for _, i in ranked if any(p.search(lines[i]) for p in _STRONG_SHAPES)), None)
+        if _GUARD_WORDS.search(issue.lower()) and shaped is not None and _DIVISION.search(lines[shaped]):
+            sites = [guard, *sites]
+        else:
+            # With no strong evidence either way, the most suspicious line still goes first.
+            strong = max(sum(1 for score, _ in ranked if score >= _SYMPTOM_WEIGHT), 1)
+            sites = [*sites[:strong], guard, *sites[strong:]]
 
-    guard = (body, body)
-    if _GUARD_WORDS.search(issue.lower()) and any(_DIVISION.search(lines[i]) for i in range(start, end)):
-        return [guard, *sites]
-    # With no strong evidence either way, the most suspicious line still goes first.
-    strong = max(sum(1 for score, _ in ranked if score >= _SYMPTOM_WEIGHT), 1)
-    return [*sites[:strong], guard, *sites[strong:]]
+    faults = _faults(lines, ranked)
+    hunks = _suspicious_hunks(lines, faults)
+    ordered: list[tuple[int, ...]] = []
+    for site in sites:
+        # Hunks go right before the first of their lines to be tried alone; a
+        # region not inside another one is first repaired fault by fault.
+        for hunk in hunks:
+            if hunk in ordered or not (hunk[0] <= site[0] < hunk[1] and site[1] > site[0]):
+                continue
+            if not any(other[0] <= hunk[0] and hunk[1] <= other[1] and other != hunk for other in hunks):
+                ordered.append((*hunk, *(fault for fault in faults if hunk[0] <= fault < hunk[1])))
+            ordered.append(hunk)
+        ordered.append(site)
+    return ordered
+
+
+# Most lines one request replaces: the model rewrites (and breaks) a whole
+# commented-out body.
+_MAX_HUNK_LINES = 6
+# Shapes a line must have to join a hunk; a plain loop or `if` is not enough.
+_STRONG_SHAPES = (_BOUND, re.compile(r"\(int\)\s*\("), _DIVISION, _ARITHMETIC)
+
+
+def _faults(lines: list[str], ranked: list[tuple[float, int]]) -> list[int]:
+    """The ranked lines that look buggy on their own, in source order: a bug
+    shape (an off-by-one bound, a truncating cast, a division, arithmetic), or
+    the issue's symptom or quoted code pointing at the line."""
+    return sorted(
+        index
+        for score, index in ranked
+        if score >= _SYMPTOM_WEIGHT or any(pattern.search(lines[index]) for pattern in _STRONG_SHAPES)
+    )
+
+
+def _suspicious_hunks(lines: list[str], faults: list[int]) -> list[tuple[int, int]]:
+    """Multi-fault regions as (i, j) sites, the widest first.
+
+    Faults (see `_faults`) with only braces or blank lines between them form one region,
+    from the first fault to the last: the commented-out code starts at the
+    first buggy line and stops at the last one, and the "}" between them goes
+    with it. In
+
+        for (int i = 0; i <= prices.length; i++) {   <- fault
+            total += prices[i] - quantities[i];      <- fault
+        }
+        return total / prices.length;                <- fault
+    }
+
+    the region is the four lines up to the return, since fixing a single one
+    of them still leaves the method wrong. Each run of directly adjacent faults
+    inside it (the loop and its body) is tried next.
+    """
+    regions: list[list[int]] = []
+    runs: list[list[int]] = []
+    for index in faults:
+        gap = lines[regions[-1][-1] + 1 : index] if regions else None
+        if gap is not None and index - regions[-1][0] < _MAX_HUNK_LINES and all(
+            not line.strip() or _NOT_A_STATEMENT.match(line.strip()) for line in gap
+        ):
+            regions[-1].append(index)
+        else:
+            regions.append([index])
+        if runs and runs[-1][-1] == index - 1 and index - runs[-1][0] < _MAX_HUNK_LINES:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    hunks = [(group[0], group[-1] + 1) for group in [*regions, *runs] if len(group) > 1]
+    return sorted(dict.fromkeys(hunks), key=lambda hunk: hunk[0] - hunk[1])
 
 
 def _first_statement(lines: list[str], start: int, end: int) -> int | None:
@@ -1251,7 +1375,18 @@ def _splice_or2(
 ) -> str:
     """Put the OR2 reply in place of lines[start:end], validate, and return the diff."""
     from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
-    from src.agents.coding_agent.function_patch import make_diff  # noqa: PLC0415
+
+    repaired = "\n".join(lines[:start] + _or2_lines(lines, start, end, reply) + lines[end:])
+    if original.endswith("\n"):
+        repaired += "\n"
+    if repaired == original:
+        raise PatchGenerationError("The remote model returned the line unchanged.")
+    return _validated_diff(original, repaired, file_path, language)
+
+
+def _or2_lines(lines: list[str], start: int, end: int, reply: str) -> list[str]:
+    """The OR2 reply as the lines that replace lines[start:end]."""
+    from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
 
     fixed = reply.splitlines()
     while fixed and not fixed[0].strip():
@@ -1273,12 +1408,13 @@ def _splice_or2(
     indent = next((line[: len(line) - len(line.lstrip())] for line in lines[start : max(end, start + 1)] if line.strip()), "")
     if len(fixed[0]) - len(fixed[0].lstrip()) < len(indent):
         fixed[0] = indent + fixed[0].lstrip()
+    return fixed
 
-    repaired = "\n".join(lines[:start] + fixed + lines[end:])
-    if original.endswith("\n"):
-        repaired += "\n"
-    if repaired == original:
-        raise PatchGenerationError("The remote model returned the line unchanged.")
+
+def _validated_diff(original: str, repaired: str, file_path: str, language: str) -> str:
+    """The diff from original to repaired, once repaired passes the language's checks."""
+    from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
+    from src.agents.coding_agent.function_patch import make_diff  # noqa: PLC0415
 
     if language == "java":
         try:

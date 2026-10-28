@@ -41,6 +41,13 @@ BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts", "gradlew")
 
 _PUBLIC_TYPE_RE = re.compile(r"^\s*public\s+(?:(?:final|abstract|sealed|strictfp)\s+)*(?:class|interface|enum|record)\s+(\w+)", re.M)
 _PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
+_TYPE_DECLARATION_RE = re.compile(
+    r"^\s*(?:(?:public|protected|private|final|abstract|static|sealed|non-sealed|strictfp)\s+)*"
+    r"(?:class|interface|enum|record|@interface)\s+([A-Za-z_]\w*)",
+    re.M,
+)
+# Lines that may come before the first type: package, imports, comments.
+_HEADER_LINE_RE = re.compile(r"^\s*(package\s|import\s|//|/\*|\*)")
 _SKIP_DIRS = {".git", "build", "target", "out", ".gradle", "node_modules"}
 
 
@@ -60,7 +67,7 @@ def run_suite(repository: str | Path, paths: list[str] | None = None) -> dict[st
     except OSError as error:
         return _result("FAIL", errors=[f"Could not get the JUnit runner: {error}"])
 
-    sources = java_sources(Path(repository))
+    sources = compile_set(java_sources(Path(repository)))
     if not sources:
         return _result("FAIL", errors=["The repository has no Java source files."])
 
@@ -127,11 +134,63 @@ def java_sources(repository: Path) -> list[Path]:
     )
 
 
+def compile_set(sources: list[Path]) -> list[Path]:
+    """The files javac compiles together: all of them, unless two declare the
+    same class.
+
+    Loose repositories hold unrelated programs side by side in the default
+    package (OrderService.java and E-Commerce.java each with its own `class
+    Product`), and javac rejects such a pair outright. Then the set is every
+    file outside a clash, every test, and each clashing file that one of those
+    uses by name -- a file declaring a class itself never pulls in another
+    file's copy of it.
+    """
+    texts = {path: as_compiled(path.read_text(encoding="utf-8", errors="replace"), path.name) for path in sources}
+    declared = {path: set(_TYPE_DECLARATION_RE.findall(text)) for path, text in texts.items()}
+    owners: dict[str, list[Path]] = {}
+    for path, names in declared.items():
+        for name in names:
+            owners.setdefault(name, []).append(path)
+    clashing = {path for paths in owners.values() if len(paths) > 1 for path in paths}
+    if not clashing:
+        return sources
+
+    chosen = [path for path in sources if path not in clashing or "@Test" in texts[path]]
+    queue = list(chosen)
+    while queue:
+        path = queue.pop()
+        for name in set(re.findall(r"\b[A-Za-z_]\w*\b", texts[path])) - declared[path]:
+            # A name two files declare is ambiguous; leave both out.
+            found = owners.get(name, [])
+            if len(found) == 1 and found[0] not in chosen:
+                chosen.append(found[0])
+                queue.append(found[0])
+    return sorted(chosen)
+
+
+def as_compiled(text: str, file_name: str) -> str:
+    """The file as the sandbox compiles it: members with no class around them
+    (a loose ``public int total(...) { ... }``, which javac rejects with "class,
+    interface, enum, or record expected") go inside ``public class <file stem>``.
+
+    The class opens on the first member's line, so javac's line numbers still
+    match the repository's file. Any other file is returned as it is.
+    """
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip() and not _HEADER_LINE_RE.match(line)), None)
+    if first is None or _TYPE_DECLARATION_RE.search(text):
+        return text
+    name = re.sub(r"\W", "_", PurePosixPath(file_name).stem)
+    name = f"_{name}" if name[0].isdigit() else name
+    lines[first] = f"public class {name} {{ {lines[first]}"
+    return "\n".join(lines) + "\n}\n"
+
+
 def stage_sources(sources: list[Path], staging: Path) -> list[str]:
     """Copy each file to <package dirs>/<its public class>.java; return the staged paths."""
     staged = []
     for source in sources:
-        text = source.read_text(encoding="utf-8", errors="replace")
+        text = as_compiled(source.read_text(encoding="utf-8", errors="replace"), source.name)
         package = _PACKAGE_RE.search(text)
         public = _PUBLIC_TYPE_RE.search(text)
         directory = staging.joinpath(*package.group(1).split(".")) if package else staging
@@ -139,7 +198,7 @@ def stage_sources(sources: list[Path], staging: Path) -> list[str]:
         if target.exists():  # two files claiming one name: keep both compilable
             target = directory / f"_{len(staged)}_{target.name}"
         directory.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        target.write_text(text, encoding="utf-8")
         staged.append(str(target))
     return staged
 

@@ -237,6 +237,100 @@ def test_code_quoted_in_the_issue_is_tried_first():
     assert sites[0] == (8, 9)
 
 
+REVENUE = """public class Revenue {
+    public int calculateTotalRevenue(int[] prices, int[] quantities) {
+        int total = 0;
+        for (int i = 0; i <= prices.length; i++) {
+            total += prices[i] - quantities[i];
+        }
+        return total / prices.length;
+    }
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "issue",
+    [
+        "",
+        "calculateTotalRevenue throws ArrayIndexOutOfBoundsException and returns the wrong total revenue.",
+        "The revenue is wrong: price should be multiplied by quantity, and the loop goes out of bounds.",
+    ],
+)
+def test_a_multi_fault_region_is_repaired_one_fault_at_a_time(tmp_path, monkeypatch, issue):
+    # The loop bound (<=), the operator (-) and the division are all wrong, with
+    # only a "}" between them: one region, not the guard before the division.
+    # Given all three at once, the real model copied `- quantities[i]` back.
+    (tmp_path / "Revenue.java").write_text(REVENUE, encoding="utf-8")
+    sent = []
+    # The replies the Colab endpoint gave for each one-line prompt.
+    replies = {
+        "for (int i = 0; i <= prices.length; i++) {": "for (int i = 0; i < prices.length; i++) {",
+        "total += prices[i] - quantities[i];": "total += prices[i] * quantities[i];",
+        "return total / prices.length;": "return total;",
+    }
+
+    def fake_urlopen(request, timeout):
+        prompt = json.loads(request.data)["prompt"]
+        sent.append(prompt)
+        buggy = prompt.split("// buggy code\n//", 1)[1].split("\n", 1)[0].strip()
+        return io.BytesIO(json.dumps({"repair": replies[buggy] + "\n</s>"}).encode())
+
+    monkeypatch.setattr(adapters.urllib.request, "urlopen", fake_urlopen)
+    chunk = {"file": "Revenue.java", "name": "calculateTotalRevenue", "type": "method", "language": "java",
+             "start_line": 2, "end_line": 8, "code": ""}
+
+    patch = adapters.remote_patch(str(tmp_path), [chunk], issue=issue)
+
+    # Each prompt comments out only its own fault, below the repairs made so far.
+    assert [prompt.split("\n\n", 1)[1] for prompt in sent] == [
+        "    public int calculateTotalRevenue(int[] prices, int[] quantities) {\n"
+        "        int total = 0;\n"
+        "// buggy code\n"
+        "//         for (int i = 0; i <= prices.length; i++) {\n"
+        "        <FILL_ME>\n"
+        "            total += prices[i] - quantities[i];\n"
+        "        }\n"
+        "        return total / prices.length;\n"
+        "    }",
+        "    public int calculateTotalRevenue(int[] prices, int[] quantities) {\n"
+        "        int total = 0;\n"
+        "        for (int i = 0; i < prices.length; i++) {\n"
+        "// buggy code\n"
+        "//             total += prices[i] - quantities[i];\n"
+        "            <FILL_ME>\n"
+        "        }\n"
+        "        return total / prices.length;\n"
+        "    }",
+        "    public int calculateTotalRevenue(int[] prices, int[] quantities) {\n"
+        "        int total = 0;\n"
+        "        for (int i = 0; i < prices.length; i++) {\n"
+        "            total += prices[i] * quantities[i];\n"
+        "        }\n"
+        "// buggy code\n"
+        "//         return total / prices.length;\n"
+        "        <FILL_ME>\n"
+        "    }",
+    ]
+    assert "+        for (int i = 0; i < prices.length; i++) {\n" \
+           "+            total += prices[i] * quantities[i];\n" in patch
+    assert "+        return total;\n" in patch
+    subprocess.run(["git", "apply", "--check", "-"], cwd=tmp_path, input=patch, text=True, check=True)
+
+
+def test_the_multi_fault_region_ends_at_its_last_buggy_line():
+    lines = REVENUE.splitlines()
+
+    sites = adapters._repair_sites(lines, 1, 2, 7, "")
+
+    # Lines 4, 5 and 7 (1-based) one at a time, then lines 4-7 together, then 4-5.
+    assert sites[:3] == [(3, 7, 3, 4, 6), (3, 7), (3, 5)]
+    assert adapters._site_name(sites[0]) == "lines 4, 5, 7 one at a time"
+    assert adapters._ir4(lines, 1, 3, 7, 8, "Revenue.java", "java").endswith(
+        "//         return total / prices.length;\n        <FILL_ME>\n    }"
+    )
+
+
 TRIE = """public class BuggyTrie {
     private static class TrieNode {
         Map<Character, TrieNode> children = new HashMap<>();
