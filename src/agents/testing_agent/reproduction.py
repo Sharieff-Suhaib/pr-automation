@@ -126,6 +126,33 @@ def prepare_reproduction(
         reproduction["path"] = str(PurePosixPath(target).parent / f"{JAVA_REPRO_CLASS}.java")
     path = reproduction["path"]
 
+    def property_test() -> dict[str, Any] | None:
+        """The baseline with a built-in check any fix must satisfy, if it reproduces the issue."""
+        source = java_property_test(issue, target_source, methods)
+        if not source:
+            return None
+        baseline = run_baseline(
+            repository, workspace_root, language=language, extra_files={path: source}, python=python
+        )
+        accepted, reason, tests = classify(baseline)
+        if not accepted:
+            return None
+        reproduction.update(
+            status="accepted",
+            reason=f"{reason} (built-in check, written without the model)",
+            source=source,
+            tests=tests,
+            baseline_outcomes=_repro_only(baseline.get("cases", {})),
+            messages=_repro_only(baseline.get("messages", {})),
+        )
+        return baseline
+
+    # Java: the built-in check first. It runs in seconds; each model attempt
+    # takes half a minute or more, and is only needed when the check cannot
+    # reproduce the issue.
+    if lang == "java" and (baseline := property_test()):
+        return reproduction, baseline
+
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         reproduction["attempts"] = attempt
@@ -184,23 +211,6 @@ def prepare_reproduction(
         if accepted:
             return reproduction, baseline
         feedback = _feedback(reason, source)
-
-    if lang == "java" and (source := java_property_test(issue, target_source, methods)):
-        # The model's tests reproduced nothing; a property any fix must satisfy might.
-        baseline = run_baseline(
-            repository, workspace_root, language=language, extra_files={path: source}, python=python
-        )
-        accepted, reason, tests = classify(baseline)
-        if accepted:
-            reproduction.update(
-                status="accepted",
-                reason=f"{reason} (built-in check, written without the model)",
-                source=source,
-                tests=tests,
-                baseline_outcomes=_repro_only(baseline.get("cases", {})),
-                messages=_repro_only(baseline.get("messages", {})),
-            )
-            return reproduction, baseline
 
     reproduction["tests"] = []
     return reproduction, plain_baseline()

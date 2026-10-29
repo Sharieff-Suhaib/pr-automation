@@ -82,12 +82,53 @@ def test_the_region_from_bug_start_to_bug_end_goes_to_the_remote_model_as_one_ir
     subprocess.run(["git", "apply", "--check", "-"], cwd=tmp_path, input=patch, text=True, check=True)
 
 
+def test_a_buggy_line_the_region_reply_copied_back_is_asked_about_alone(tmp_path, monkeypatch, ollama):
+    (tmp_path / "Revenue.java").write_text(REVENUE, encoding="utf-8")
+    ollama('{"buggy_lines": [4, 5, 7], "start": 4, "end": 7}')
+    sent = []
+    # The replies the Colab endpoint gave: the region's leaves the operator as
+    # it was; asked about that line alone, it multiplies.
+    region_reply = ("for (int i = 0; i < prices.length; i++) {\n            total += prices[i] - quantities[i];\n"
+                    "        }\n        return total;")
+    line_reply = "total += prices[i] * quantities[i];"
+
+    def fake_urlopen(request, timeout):
+        prompt = json.loads(request.data)["prompt"]
+        sent.append(prompt)
+        reply = line_reply if "//             total +=" in prompt and "//         for" not in prompt else region_reply
+        return io.BytesIO(json.dumps({"repair": reply + "\n</s>"}).encode())
+
+    monkeypatch.setattr(adapters.urllib.request, "urlopen", fake_urlopen)
+
+    patch = adapters.remote_patch(str(tmp_path), [REVENUE_CHUNK], issue=REVENUE_ISSUE)
+
+    assert len(sent) == 2
+    # The follow-up holds the region's repairs and comments out only line 5.
+    assert sent[1].split("\n\n", 1)[1] == (
+        "    public int calculateTotalRevenue(int[] prices, int[] quantities) {\n"
+        "        int total = 0;\n"
+        "        for (int i = 0; i < prices.length; i++) {\n"
+        "// buggy code\n"
+        "//             total += prices[i] - quantities[i];\n"
+        "            <FILL_ME>\n"
+        "        }\n"
+        "        return total;\n"
+        "    }"
+    )
+    assert "+        for (int i = 0; i < prices.length; i++) {\n" \
+           "+            total += prices[i] * quantities[i];\n" in patch
+    assert "+        return total;\n" in patch
+    subprocess.run(["git", "apply", "--check", "-"], cwd=tmp_path, input=patch, text=True, check=True)
+
+
 @pytest.mark.parametrize(
     "reply",
     [
         '{"start": 4, "end": 7}',
         # Several regions become one, from the first start to the last end.
         '{"regions": [{"start": 4, "end": 5}, {"start": 7, "end": 7}]}',
+        # A buggy line past "end" still widens the region to reach it.
+        '{"buggy_lines": [4, 5, 7], "start": 4, "end": 5}',
         # The signature and the closing brace are clipped off: only the body is repaired.
         '{"start": 2, "end": 8}',
     ],
@@ -132,7 +173,7 @@ def test_the_region_stays_inside_one_function(ollama):
     ollama('{"regions": [{"start": 2, "end": 2}, {"start": 3, "end": 3}, {"start": 6, "end": 6}]}')
 
     # Lines 2-3 of f(); line 6 is in g(), which one IR4 hole cannot reach.
-    assert fault_localization.ollama_localize(lines, [(1, 3), (5, 7)], "wrong value", "m.py") == (2, 3)
+    assert fault_localization.ollama_localize(lines, [(1, 3), (5, 7)], "wrong value", "m.py") == (2, 3, (2, 3))
 
 
 def test_the_standalone_localizer_builds_its_ir4_from_the_ollama_region(tmp_path, ollama):

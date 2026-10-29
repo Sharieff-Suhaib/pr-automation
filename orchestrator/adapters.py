@@ -992,9 +992,8 @@ def _remote_sites(
             f"total_lines={len(lines)}"
         )
 
-    sites = _ollama_sites(lines, head, start, end, stop, issue, file_path, language) or _repair_sites(
-        lines, head, start, end, issue
-    )
+    localized = _ollama_site(lines, head, start, end, stop, issue, file_path, language)
+    sites = [localized[0]] if localized else _repair_sites(lines, head, start, end, issue)
     if not sites:
         raise PatchGenerationError(
             f"{target.get('name', 'The function')} in {file_path} has no statement to repair."
@@ -1008,17 +1007,21 @@ def _remote_sites(
         "lines": lines,
         "head": head,
         "stop": stop,
+        # Ollama's buggy lines, each asked about alone when the reply for
+        # the whole region copies it back unchanged.
+        "follow_up": localized[1] if localized else [],
     }
     return context, sites
 
 
-def _ollama_sites(
+def _ollama_site(
     lines: list[str], head: int, start: int, end: int, stop: int, issue: str, file_path: str, language: str
-) -> list[tuple[int, int]]:
-    """The one repair site Ollama names in the function: from the line the
+) -> tuple[tuple[int, int], list[int]] | None:
+    """The one repair site Ollama names in the function, from the line the
     bug starts on to the line it ends on, as (i, j), all of it under a
-    single <FILL_ME>. [] when Ollama cannot say, so the caller falls back to
-    the heuristic sites (`_repair_sites`)."""
+    single <FILL_ME>; and the 0-based lines in it Ollama marked as buggy.
+    None when Ollama cannot say, so the caller falls back to the heuristic
+    sites (`_repair_sites`)."""
     from src.agents.coding_agent.fault_localization import (  # noqa: PLC0415
         LocalizationError,
         ollama_localize,
@@ -1026,10 +1029,10 @@ def _ollama_sites(
 
     try:
         # Ollama sees the whole function, signature included, by file line number.
-        first, last = ollama_localize(lines, [(head + 1, stop)], issue, file_path)
+        first, last, buggy_lines = ollama_localize(lines, [(head + 1, stop)], issue, file_path)
     except LocalizationError as error:
         print(f"{error} Using heuristic repair sites.", flush=True)
-        return []
+        return None
     # 1-based inclusive to 0-based half-open, kept inside the body: the
     # signature (and a Java method's closing brace) is never replaced.
     site_start, site_end = max(first - 1, start), min(last, end)
@@ -1040,7 +1043,11 @@ def _ollama_sites(
         while depth > 0 and site_end < end:
             depth += lines[site_end].count("{") - lines[site_end].count("}")
             site_end += 1
-    return [(site_start, site_end)] if site_start < site_end else []
+    if site_start >= site_end:
+        return None
+    # A one-line region asked about again would get the same reply.
+    follow_up = [number - 1 for number in buggy_lines if site_start < number <= site_end]
+    return (site_start, site_end), follow_up if site_end - site_start > 1 else []
 
 
 def _site_name(site: tuple[int, ...]) -> str:
@@ -1059,6 +1066,8 @@ def _remote_candidate(target: dict[str, Any], site: tuple[int, ...], issue: str)
 
     if len(site) > 2:
         return _remote_candidate_per_fault(target, site[2:], issue)
+    if target.get("follow_up"):
+        return _remote_candidate_with_follow_ups(target, site, issue)
     site_start, site_end = site
     lines = target["lines"]
     reply = _ask_for_site(target, lines, site_start, site_end, target["stop"], issue, _site_name(site))
@@ -1089,6 +1098,52 @@ def _ask_for_site(
         flush=True,
     )
     return _ask_remote_model(prompt, target["language"], target["file_path"], target["name"])
+
+
+def _remote_candidate_with_follow_ups(target: dict[str, Any], site: tuple[int, int], issue: str) -> str:
+    """Repair Ollama's region in one request, then each buggy line the reply
+    copied back unchanged in a request of its own, and return it all as one
+    diff. Every prompt has a single <FILL_ME>.
+
+    Given lines 3-6 of calculateTotalRevenue, the model fixes the loop bound
+    and the division but returns `total += prices[i] - quantities[i];` as it
+    was; asked about that line alone, it multiplies.
+    """
+    from src.agents.coding_agent.code_generator import PatchGenerationError  # noqa: PLC0415
+
+    start, end = site
+    original_lines = target["lines"]
+    lines = list(original_lines)
+    reply = _ask_for_site(target, lines, start, end, target["stop"], issue, _site_name(site))
+    fixed = _or2_lines(lines, start, end, reply)
+    lines[start:end] = fixed
+    shift = len(fixed) - (end - start)  # lines added (or removed) so far
+    region_end = start + len(fixed)
+
+    for fault in target["follow_up"]:
+        # Still in the repaired region exactly as it was: copied back, not fixed.
+        index = next((i for i in range(start, region_end) if lines[i] == original_lines[fault]), None)
+        if index is None:
+            continue
+        where = f"line {fault + 1}, unchanged by the repair of {_site_name(site)}"
+        try:
+            reply = _ask_for_site(target, lines, index, index + 1, target["stop"] + shift, issue, where)
+            line_fix = _or2_lines(lines, index, index + 1, reply)
+        except PatchGenerationError as error:
+            if str(error).startswith(_REMOTE_DOWN):
+                raise
+            print(f"Follow-up repair at {where} rejected: {error}", flush=True)
+            continue
+        lines[index : index + 1] = line_fix
+        shift += len(line_fix) - 1
+        region_end += len(line_fix) - 1
+
+    repaired = "\n".join(lines)
+    if target["original"].endswith("\n"):
+        repaired += "\n"
+    if repaired == target["original"]:
+        raise PatchGenerationError("The remote model returned the region unchanged.")
+    return _validated_diff(target["original"], repaired, target["file_path"], target["language"])
 
 
 def _remote_candidate_per_fault(target: dict[str, Any], faults: tuple[int, ...], issue: str) -> str:

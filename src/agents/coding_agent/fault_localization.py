@@ -7,7 +7,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 # ============================================================================
@@ -58,12 +58,16 @@ LOCALIZER_MODEL = os.environ.get(
     "",
 )
 
-LOCALIZER_SYSTEM_PROMPT = """You are a fault-localization tool.
-You read a bug report and source code with line numbers, and you name the
-line where the buggy code starts and the line where it ends. You never fix
-the code.
+# Tested with codellama:7b: asked only for "start" and "end", it stops at the
+# first bug (lines 3-5 of calculateTotalRevenue, not the division on line 6).
+# Made to check every line and list the buggy ones first, it covers them all.
+LOCALIZER_SYSTEM_PROMPT = """You are a fault-localization tool. You read a bug report and source code
+with line numbers. Check EVERY line of the code for a bug: loop bounds
+(<= instead of <, - 1), wrong arithmetic operators, division that is wrong
+or can divide by zero, wrong comparisons, wrong return values. The code
+may hold several bugs. You never fix the code.
 Answer with JSON only, in this shape:
-{"start": <first buggy line>, "end": <last buggy line>}"""
+{"buggy_lines": [<every buggy line number>], "start": <first buggy line>, "end": <last buggy line>}"""
 
 
 # ============================================================================
@@ -78,6 +82,15 @@ class SuspiciousRegion:
     score: float
     original_code: str
     ir4: str
+
+
+class LocalizedBug(NamedTuple):
+    """The region Ollama names, 1-based and inclusive."""
+
+    start: int
+    end: int
+    # The lines in start..end that Ollama marked as buggy.
+    buggy_lines: tuple[int, ...]
 
 
 class LocalizationError(RuntimeError):
@@ -252,11 +265,11 @@ using the line numbers on the left. A one-line bug has "start" equal to
 must change, never a whole function."""
 
 
-def parse_regions(
+def reply_json(
     reply: str,
-) -> list[tuple[int, int]]:
+) -> Any:
     """
-    Read (start, end) pairs from the model's JSON reply.
+    The JSON in the model's reply, even with words around it.
     """
 
     text = reply.strip()
@@ -268,7 +281,7 @@ def parse_regions(
     )
 
     try:
-        data = json.loads(
+        return json.loads(
             match.group(0)
             if match
             else text
@@ -279,11 +292,62 @@ def parse_regions(
             f"Ollama did not answer with JSON: {text[:200]!r}"
         ) from error
 
+
+def parse_buggy_lines(
+    reply: str,
+) -> list[int]:
+    """
+    Read the "buggy_lines" list from the model's JSON reply.
+    """
+
+    data = reply_json(reply)
+
+    numbers = (
+        data.get("buggy_lines")
+        if isinstance(data, dict)
+        else None
+    )
+
+    result: list[int] = []
+
+    for number in numbers if isinstance(numbers, list) else []:
+        try:
+            result.append(
+                int(number)
+            )
+
+        except (TypeError, ValueError):
+            continue
+
+    return result
+
+
+def parse_regions(
+    reply: str,
+) -> list[tuple[int, int]]:
+    """
+    Read (start, end) pairs from the model's JSON reply.
+    """
+
+    data = reply_json(reply)
+
     if isinstance(data, dict):
-        data = data.get(
+        # {"start", "end"} itself, a "regions" list, and every line of
+        # "buggy_lines" all name buggy code; the span covers them all.
+        regions = data.get(
             "regions",
             [data],
         )
+
+        buggy_lines = data.get(
+            "buggy_lines",
+            [],
+        )
+
+        data = [
+            *(regions if isinstance(regions, list) else []),
+            *(buggy_lines if isinstance(buggy_lines, list) else []),
+        ]
 
     if not isinstance(data, list):
         return []
@@ -397,14 +461,15 @@ def ollama_localize(
     ranges: list[tuple[int, int]],
     issue: str,
     file_path: str,
-) -> tuple[int, int]:
+) -> LocalizedBug:
     """
     Ask Ollama where the bug starts and ends inside `ranges`.
 
-    `ranges` and the result are 1-based, inclusive (start, end) line
-    numbers. The result is one region from the first buggy line to the
-    last, even when Ollama names several. Raises LocalizationError when
-    Ollama is switched off, unreachable, or names no usable line.
+    `ranges` and the result are 1-based, inclusive line numbers. The
+    result is one region from the first buggy line to the last, even when
+    Ollama names several, and the lines in it Ollama marked as buggy.
+    Raises LocalizationError when Ollama is switched off, unreachable, or
+    names no usable line.
     """
 
     if LOCALIZER != "ollama":
@@ -468,13 +533,38 @@ def ollama_localize(
         if container[0] <= first <= container[1]
     )
 
+    def is_code(number: int) -> bool:
+        return lines[number - 1].strip() not in {"", "{", "}"}
+
+    # Without a "buggy_lines" list every line of code in the region counts.
+    buggy_lines = sorted(
+        {
+            number
+            for number in parse_buggy_lines(reply)
+            if start <= number <= end
+            and is_code(number)
+        }
+    ) or [
+        number
+        for number in range(
+            start,
+            end + 1,
+        )
+        if is_code(number)
+    ]
+
     print(
         f"Ollama localized {file_path}: "
-        f"lines {start}-{end}",
+        f"lines {start}-{end}, buggy lines "
+        f"{', '.join(str(number) for number in buggy_lines)}",
         flush=True,
     )
 
-    return start, end
+    return LocalizedBug(
+        start=start,
+        end=end,
+        buggy_lines=tuple(buggy_lines),
+    )
 
 
 # ============================================================================
@@ -966,7 +1056,7 @@ def localize_relevant_file(
     )
 
     try:
-        start_line, end_line = ollama_localize(
+        start_line, end_line, _ = ollama_localize(
             lines=lines,
             ranges=allowed_ranges,
             issue=issue,
